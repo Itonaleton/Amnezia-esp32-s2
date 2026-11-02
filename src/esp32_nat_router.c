@@ -750,7 +750,7 @@ static void setLogLevel(void)
         break;
     }
 }
-
+void register_awg_commands(void);
 void app_main(void)
 {
     initialize_nvs();
@@ -765,8 +765,9 @@ void app_main(void)
     /* Register commands */
     esp_console_register_help_command();
     register_system();
-
+    
     register_router();
+    register_awg_commands();
     fillMac();
     get_config_param_str("ssid", &ssid);
     if (ssid == NULL)

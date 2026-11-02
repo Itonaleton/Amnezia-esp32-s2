@@ -24,16 +24,27 @@ jobs:
           rm -rf components/esp_wireguard
           git clone --recursive https://github.com/trombik/esp_wireguard.git components/esp_wireguard
           python3 - << 'EOF'
-          import re
+          import glob, re, sys
 
-          wg_c_path = "components/esp_wireguard/wireguard-lwip/src/wireguard.c"
-          wgif_c_path = "components/esp_wireguard/wireguard-lwip/src/wireguardif.c"
+          wg_c_matches = glob.glob("components/esp_wireguard/**/wireguard.c", recursive=True)
+          wgif_c_matches = glob.glob("components/esp_wireguard/**/wireguardif.c", recursive=True)
+
+          if not wg_c_matches or not wgif_c_matches:
+              print("ERROR: wireguard.c or wireguardif.c not found in components/esp_wireguard!")
+              sys.exit(1)
+
+          wg_c_path = wg_c_matches[0]
+          wgif_c_path = wgif_c_matches[0]
+          print(f"Found wireguard.c at: {wg_c_path}")
+          print(f"Found wireguardif.c at: {wgif_c_path}")
 
           # 1. Патчим wireguard.c (заголовки H1-H4 при создании и проверке пакетов)
           with open(wg_c_path, "r") as f:
               wg_c = f.read()
 
           extern_decl = """
+          #include <stdbool.h>
+          #include <stdint.h>
           extern void awg_write_h1(uint8_t *p);
           extern void awg_write_h2(uint8_t *p);
           extern void awg_write_h3(uint8_t *p);
@@ -86,7 +97,6 @@ jobs:
           """
           wgif_c = '#include "wireguardif.h"\n' + wgif_extern + wgif_c.replace('#include "wireguardif.h"', '', 1)
 
-          # Подменяем отправку в wireguardif_device_output для добавления префиксов S1-S4
           new_dev_out = """static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
               uint16_t s_len = awg_get_tx_prefix_len((const uint8_t *)q->payload, q->tot_len);
               if (s_len > 0) {
@@ -109,20 +119,17 @@ jobs:
               flags=re.DOTALL
           )
 
-          # Записываем H4 в заголовок пакета данных
           wgif_c = re.sub(
               r"header->type\s*=\s*MESSAGE_TRANSPORT_DATA;\s*header->reserved_zero\[0\]\s*=\s*0;\s*header->reserved_zero\[1\]\s*=\s*0;\s*header->reserved_zero\[2\]\s*=\s*0;",
               "awg_write_h4(&header->type);",
               wgif_c
           )
 
-          # Отправляем I1 и Jc перед рукопожатием
           wgif_c = wgif_c.replace(
               "pbuf = wireguardif_initiate_handshake(device, peer, &msg, &err);",
               "awg_send_pre_handshake(device->udp_pcb, &peer->ip, peer->port);\n\tpbuf = wireguardif_initiate_handshake(device, peer, &msg, &err);"
           )
 
-          # Снимаем префикс S1-S4 на приеме в wireguardif_network_rx
           wgif_c = wgif_c.replace(
               "size_t len = p->len;",
               "size_t len = p->len;\n\t\tawg_strip_rx_prefix(&data, &len);"

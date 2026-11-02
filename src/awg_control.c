@@ -78,8 +78,8 @@ static int cmd_awg_up(int argc, char **argv) {
     wireguard_config_t wg_config = ESP_WIREGUARD_CONFIG_DEFAULT();
     wg_config.private_key = g_awg_cfg.privkey;
     wg_config.public_key = g_awg_cfg.pubkey;
-    wg_config.address = g_awg_cfg.ip;
-    wg_config.netmask = "255.255.255.0";
+    wg_config.allowed_ip = g_awg_cfg.ip;
+    wg_config.allowed_ip_mask = "255.255.255.0";
     wg_config.endpoint = g_awg_cfg.endpoint;
     wg_config.port = g_awg_cfg.port;
     wg_config.persistent_keepalive = 25;

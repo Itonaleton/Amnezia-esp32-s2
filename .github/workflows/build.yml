@@ -1,1 +1,31 @@
-name: Build ESP32-S2 firmwareon:  push:  workflow_dispatch:jobs:  build:    runs-on: ubuntu-latest    steps:      - uses: actions/checkout@v4        with:          submodules: recursive      - uses: actions/setup-python@v5        with:          python-version: "3.11"      - name: Install PlatformIO        run: pip install platformio      - name: Build        run: pio run -e esp32-s2      - name: Upload firmware        uses: actions/upload-artifact@v4        with:          name: firmware-esp32-s2          path: |            .pio/build/esp32-s2/bootloader.bin            .pio/build/esp32-s2/partitions.bin            .pio/build/esp32-s2/firmware.bin
+name: Build ESP32-S2 firmware
+on:  
+  push:  
+  workflow_dispatch:
+  
+jobs:  
+  build:    
+    runs-on: ubuntu-latest    
+    steps:      
+      - uses: actions/checkout@v4        
+        with:          
+          submodules: recursive      
+          
+      - uses: actions/setup-python@v5
+        with:          
+          python-version: "3.11"      
+          
+      - name: Install PlatformIO        
+        run: pip install platformio      
+      
+      - name: Build        
+        run: pio run -e esp32-s2      
+      
+      - name: Upload firmware        
+        uses: actions/upload-artifact@v4        
+        with:          
+          name: firmware-esp32-s2          
+          path: |            
+            .pio/build/esp32-s2/bootloader.bin            
+            .pio/build/esp32-s2/partitions.bin            
+            .pio/build/esp32-s2/firmware.bin

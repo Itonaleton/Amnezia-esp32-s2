@@ -1,233 +1,601 @@
-/*
- * AmneziaWG control over the ESP console (UART). Config lives in RAM only.
- *
- * Commands:
- *   awg_param <key> <value>   privkey pubkey psk ip endpoint port jc jmin jmax s1 s2 s3 s4 h1..h4
- *   awg_i1 clear              clear the I1 template
- *   awg_i1 add "<chunk>"      append a chunk of the I1 template (may be called many times)
- *   awg_up                    sync time, bring tunnel up, make it the default route
- *   awg_down                  tunnel down, restore the direct route
- *   awg_wipe                  tunnel down + erase all keys/params from RAM
- *   awg_status
- */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
+#include <sys/time.h>
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_sntp.h"
+#include "esp_random.h"
 #include "esp_wireguard.h"
+#include "lwip/netif.h"
+#include "lwip/udp.h"
+#include "lwip/dns.h"
+#include "lwip/lwip_napt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/platform_util.h"
-#include "awg.h"
 
 static const char *TAG = "awg_ctrl";
 
-static struct {
+typedef struct {
     char privkey[64];
     char pubkey[64];
     char psk[64];
-    char ip[20];
+    char ip[32];
     char endpoint[96];
     int  port;
-} cfg = { .port = 51820 };
+    uint16_t jc, jmin, jmax;
+    uint16_t s1, s2, s3, s4;
+    uint32_t h1_min, h1_max;
+    uint32_t h2_min, h2_max;
+    uint32_t h3_min, h3_max;
+    uint32_t h4_min, h4_max;
+    uint8_t  hpk[32];
+    bool     hpk_set;
+    char     i1[1024];
+} awg_runtime_params_t;
 
-/* esp_wireguard keeps a pointer to the config, so it must stay alive */
-static wireguard_config_t wg_config;
-static wireguard_ctx_t wg_ctx;
+awg_runtime_params_t g_awg_cfg = {
+    .port = 51820,
+    .jc = 4, .jmin = 40, .jmax = 70,
+    .s1 = 0, .s2 = 0, .s3 = 0, .s4 = 0,
+    .h1_min = 1, .h1_max = 1,
+    .h2_min = 2, .h2_max = 2,
+    .h3_min = 3, .h3_max = 3,
+    .h4_min = 4, .h4_max = 4,
+    .hpk_set = false
+};
+
+static wireguard_config_t wg_config = ESP_WIREGUARD_CONFIG_DEFAULT();
+static wireguard_ctx_t wg_ctx = {0};
+static bool wg_inited = false;
 static bool wg_active = false;
-static bool handler_registered = false;
+static struct netif *orig_default_netif = NULL;
+static uint32_t awg_pkt_counter = 0;
 
-static void copy_str(char *dst, size_t dst_size, const char *src)
-{
-    strncpy(dst, src, dst_size - 1);
-    dst[dst_size - 1] = '\0';
+/* --- Встроенный потоковый шифр ChaCha20 IETF (для HeaderProtectionKey в AmneziaWG 3.0/3.1) --- */
+
+#define AWG_ROTL32(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
+#define AWG_QR(a, b, c, d) do { \
+    a += b; d ^= a; d = AWG_ROTL32(d, 16); \
+    c += d; b ^= c; b = AWG_ROTL32(b, 12); \
+    a += b; d ^= a; d = AWG_ROTL32(d, 8);  \
+    c += d; b ^= c; b = AWG_ROTL32(b, 7);  \
+} while (0)
+
+static uint32_t awg_read_u32_le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static bool ensure_time(void)
-{
-    const time_t valid_after = 1700000000; /* Nov 2023 */
-    if (time(NULL) > valid_after) {
-        return true;
+static void awg_write_u32_le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static void awg_chacha20_xor(uint8_t *buf, size_t len, const uint8_t key[32], const uint8_t nonce[12]) {
+    uint32_t state[16], x[16];
+    uint8_t block[64];
+    uint32_t counter = 0;
+
+    state[0] = 0x61707865;
+    state[1] = 0x3320646e;
+    state[2] = 0x79622d32;
+    state[3] = 0x6b206574;
+    for (int i = 0; i < 8; i++) {
+        state[4 + i] = awg_read_u32_le(key + i * 4);
     }
-    if (!esp_sntp_enabled()) {
-        esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-        esp_sntp_setservername(0, "pool.ntp.org");
-        esp_sntp_setservername(1, "time.google.com");
-        esp_sntp_init();
-    }
-    for (int i = 0; i < 75; i++) { /* up to 15 s */
-        if (time(NULL) > valid_after) {
-            return true;
+    state[13] = awg_read_u32_le(nonce + 0);
+    state[14] = awg_read_u32_le(nonce + 4);
+    state[15] = awg_read_u32_le(nonce + 8);
+
+    size_t offset = 0;
+    while (offset < len) {
+        state[12] = counter++;
+        for (int i = 0; i < 16; i++) x[i] = state[i];
+        for (int i = 0; i < 10; i++) {
+            AWG_QR(x[0], x[4], x[8],  x[12]);
+            AWG_QR(x[1], x[5], x[9],  x[13]);
+            AWG_QR(x[2], x[6], x[10], x[14]);
+            AWG_QR(x[3], x[7], x[11], x[15]);
+            AWG_QR(x[0], x[5], x[10], x[15]);
+            AWG_QR(x[1], x[6], x[11], x[12]);
+            AWG_QR(x[2], x[7], x[8],  x[13]);
+            AWG_QR(x[3], x[4], x[9],  x[14]);
         }
+        for (int i = 0; i < 16; i++) {
+            awg_write_u32_le(block + i * 4, x[i] + state[i]);
+        }
+        size_t chunk = (len - offset > 64) ? 64 : (len - offset);
+        for (size_t i = 0; i < chunk; i++) {
+            buf[offset + i] ^= block[i];
+        }
+        offset += chunk;
+    }
+}
+
+/* Декодер Base64 для 32-байтного ключа HeaderProtectionKey */
+static bool awg_base64_decode_32(const char *in, uint8_t out[32]) {
+    uint32_t val = 0;
+    int valb = -8;
+    size_t out_len = 0;
+    for (const char *p = in; *p && *p != '='; p++) {
+        int c = (unsigned char)*p;
+        int d = -1;
+        if (c >= 'A' && c <= 'Z') d = c - 'A';
+        else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') d = c - '0' + 52;
+        else if (c == '+') d = 62;
+        else if (c == '/') d = 63;
+        if (d < 0) continue;
+        val = (val << 6) + (uint32_t)d;
+        valb += 6;
+        if (valb >= 0) {
+            if (out_len < 32) out[out_len++] = (uint8_t)((val >> valb) & 0xFF);
+            valb -= 8;
+        }
+    }
+    return (out_len == 32);
+}
+
+/* --- Функции обфускации заголовков H1..H4 и префиксов S1..S4 --- */
+
+static uint32_t awg_rand_range(uint32_t min_v, uint32_t max_v) {
+    if (max_v <= min_v) return min_v;
+    return min_v + (esp_random() % (max_v - min_v + 1));
+}
+
+void awg_write_h1(uint8_t *p) { awg_write_u32_le(p, awg_rand_range(g_awg_cfg.h1_min, g_awg_cfg.h1_max)); }
+void awg_write_h2(uint8_t *p) { awg_write_u32_le(p, awg_rand_range(g_awg_cfg.h2_min, g_awg_cfg.h2_max)); }
+void awg_write_h3(uint8_t *p) { awg_write_u32_le(p, awg_rand_range(g_awg_cfg.h3_min, g_awg_cfg.h3_max)); }
+void awg_write_h4(uint8_t *p) { awg_write_u32_le(p, awg_rand_range(g_awg_cfg.h4_min, g_awg_cfg.h4_max)); }
+
+bool awg_check_h1(const uint8_t *p) { uint32_t v = awg_read_u32_le(p); return (v >= g_awg_cfg.h1_min && v <= g_awg_cfg.h1_max); }
+bool awg_check_h2(const uint8_t *p) { uint32_t v = awg_read_u32_le(p); return (v >= g_awg_cfg.h2_min && v <= g_awg_cfg.h2_max); }
+bool awg_check_h3(const uint8_t *p) { uint32_t v = awg_read_u32_le(p); return (v >= g_awg_cfg.h3_min && v <= g_awg_cfg.h3_max); }
+bool awg_check_h4(const uint8_t *p) { uint32_t v = awg_read_u32_le(p); return (v >= g_awg_cfg.h4_min && v <= g_awg_cfg.h4_max); }
+
+uint16_t awg_get_tx_prefix_len(const uint8_t *data, size_t len) {
+    if (len < 4) return 0;
+    if (len == 148 && awg_check_h1(data)) return g_awg_cfg.s1;
+    if (len == 92  && awg_check_h2(data)) return g_awg_cfg.s2;
+    if (len == 64  && awg_check_h3(data)) return g_awg_cfg.s3;
+    if (len >= 32  && awg_check_h4(data)) return g_awg_cfg.s4;
+    return 0;
+}
+
+/* Шифрование заголовка при отправке пакета (вызывается из wireguardif_device_output) */
+void awg_apply_tx_header_protection(uint8_t *full_pkt, uint16_t s_len, size_t wg_len) {
+    if (!g_awg_cfg.hpk_set || s_len < 12) return;
+    uint8_t *wg_hdr = full_pkt + s_len;
+    if (wg_len == 148 || wg_len == 92 || wg_len == 64) {
+        awg_chacha20_xor(wg_hdr, wg_len, g_awg_cfg.hpk, full_pkt);
+    } else if (wg_len >= 32) {
+        awg_chacha20_xor(wg_hdr, 16, g_awg_cfg.hpk, full_pkt);
+    }
+}
+
+/* Расшифровка HeaderProtectionKey и снятие префикса S1..S4 при приёме пакета */
+void awg_strip_rx_prefix(uint8_t **data, size_t *len) {
+    uint8_t *d = *data;
+    size_t l = *len;
+
+    if (g_awg_cfg.hpk_set) {
+        uint8_t ks_probe[4] = {0, 0, 0, 0};
+        if (l >= 16) {
+            awg_chacha20_xor(ks_probe, 4, g_awg_cfg.hpk, d);
+        }
+        uint32_t mask = awg_read_u32_le(ks_probe);
+
+        if (g_awg_cfg.s1 >= 12 && l >= (size_t)(g_awg_cfg.s1 + 148)) {
+            uint32_t h = awg_read_u32_le(d + g_awg_cfg.s1) ^ mask;
+            if (h >= g_awg_cfg.h1_min && h <= g_awg_cfg.h1_max) {
+                awg_chacha20_xor(d + g_awg_cfg.s1, 148, g_awg_cfg.hpk, d);
+                *data = d + g_awg_cfg.s1;
+                *len = 148;
+                return;
+            }
+        }
+        if (g_awg_cfg.s2 >= 12 && l >= (size_t)(g_awg_cfg.s2 + 92)) {
+            uint32_t h = awg_read_u32_le(d + g_awg_cfg.s2) ^ mask;
+            if (h >= g_awg_cfg.h2_min && h <= g_awg_cfg.h2_max) {
+                awg_chacha20_xor(d + g_awg_cfg.s2, 92, g_awg_cfg.hpk, d);
+                *data = d + g_awg_cfg.s2;
+                *len = 92;
+                return;
+            }
+        }
+        if (g_awg_cfg.s3 >= 12 && l >= (size_t)(g_awg_cfg.s3 + 64)) {
+            uint32_t h = awg_read_u32_le(d + g_awg_cfg.s3) ^ mask;
+            if (h >= g_awg_cfg.h3_min && h <= g_awg_cfg.h3_max) {
+                awg_chacha20_xor(d + g_awg_cfg.s3, 64, g_awg_cfg.hpk, d);
+                *data = d + g_awg_cfg.s3;
+                *len = 64;
+                return;
+            }
+        }
+        if (g_awg_cfg.s4 >= 12 && l >= (size_t)(g_awg_cfg.s4 + 32)) {
+            uint32_t h = awg_read_u32_le(d + g_awg_cfg.s4) ^ mask;
+            if (h >= g_awg_cfg.h4_min && h <= g_awg_cfg.h4_max) {
+                awg_chacha20_xor(d + g_awg_cfg.s4, 16, g_awg_cfg.hpk, d);
+                *data = d + g_awg_cfg.s4;
+                *len = l - g_awg_cfg.s4;
+                return;
+            }
+        }
+        return;
+    }
+
+    if (l == (size_t)(g_awg_cfg.s1 + 148) && awg_check_h1(d + g_awg_cfg.s1)) {
+        *data += g_awg_cfg.s1; *len -= g_awg_cfg.s1;
+    } else if (l == (size_t)(g_awg_cfg.s2 + 92) && awg_check_h2(d + g_awg_cfg.s2)) {
+        *data += g_awg_cfg.s2; *len -= g_awg_cfg.s2;
+    } else if (l == (size_t)(g_awg_cfg.s3 + 64) && awg_check_h3(d + g_awg_cfg.s3)) {
+        *data += g_awg_cfg.s3; *len -= g_awg_cfg.s3;
+    } else if (l >= (size_t)(g_awg_cfg.s4 + 32) && awg_check_h4(d + g_awg_cfg.s4)) {
+        *data += g_awg_cfg.s4; *len -= g_awg_cfg.s4;
+    }
+}
+
+static int hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static size_t awg_build_i1_packet(uint8_t *out, size_t max_len) {
+    const char *p = g_awg_cfg.i1;
+    size_t out_len = 0;
+    static const char alnum[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    while (*p && out_len < max_len) {
+        const char *lt = strchr(p, '<');
+        if (!lt) break;
+        const char *gt = strchr(lt, '>');
+        if (!gt) break;
+
+        const char *tag = lt + 1;
+        while (*tag == ' ') tag++;
+
+        if (strncmp(tag, "b ", 2) == 0 || strncmp(tag, "B ", 2) == 0) {
+            const char *hx = strstr(tag, "0x");
+            if (!hx) hx = strstr(tag, "0X");
+            hx = hx ? (hx + 2) : (tag + 2);
+            while (hx + 1 < gt && out_len < max_len) {
+                if (*hx == ' ') { hx++; continue; }
+                int hi = hex_val(hx[0]);
+                int lo = hex_val(hx[1]);
+                if (hi >= 0 && lo >= 0) {
+                    out[out_len++] = (uint8_t)((hi << 4) | lo);
+                    hx += 2;
+                } else break;
+            }
+        } else if (strncmp(tag, "rd ", 3) == 0) {
+            int n = atoi(tag + 3);
+            for (int i = 0; i < n && out_len < max_len; i++)
+                out[out_len++] = (uint8_t)('0' + (esp_random() % 10));
+        } else if (strncmp(tag, "rc ", 3) == 0) {
+            int n = atoi(tag + 3);
+            for (int i = 0; i < n && out_len < max_len; i++)
+                out[out_len++] = (uint8_t)alnum[esp_random() % (sizeof(alnum) - 1)];
+        } else if (strncmp(tag, "r ", 2) == 0) {
+            int n = atoi(tag + 2);
+            if (n > 0 && out_len + (size_t)n <= max_len) {
+                esp_fill_random(out + out_len, n);
+                out_len += n;
+            }
+        } else if (tag[0] == 't') {
+            if (out_len + 4 <= max_len) {
+                uint32_t ts = (uint32_t)time(NULL);
+                out[out_len++] = (uint8_t)((ts >> 24) & 0xFF);
+                out[out_len++] = (uint8_t)((ts >> 16) & 0xFF);
+                out[out_len++] = (uint8_t)((ts >> 8) & 0xFF);
+                out[out_len++] = (uint8_t)(ts & 0xFF);
+            }
+        } else if (tag[0] == 'c') {
+            if (out_len + 4 <= max_len) {
+                uint32_t cnt = ++awg_pkt_counter;
+                out[out_len++] = (uint8_t)((cnt >> 24) & 0xFF);
+                out[out_len++] = (uint8_t)((cnt >> 16) & 0xFF);
+                out[out_len++] = (uint8_t)((cnt >> 8) & 0xFF);
+                out[out_len++] = (uint8_t)(cnt & 0xFF);
+            }
+        }
+        p = gt + 1;
+    }
+    return out_len;
+}
+
+void awg_send_pre_handshake(struct udp_pcb *pcb, const ip_addr_t *ip, uint16_t port) {
+    if (!pcb || !ip) return;
+
+    if (orig_default_netif) {
+        udp_bind_netif(pcb, orig_default_netif);
+    }
+
+    if (g_awg_cfg.i1[0] != '\0') {
+        uint8_t *i1_buf = malloc(1200);
+        if (i1_buf) {
+            size_t i1_len = awg_build_i1_packet(i1_buf, 1200);
+            if (i1_len > 0) {
+                struct pbuf *pb = pbuf_alloc(PBUF_TRANSPORT, i1_len, PBUF_RAM);
+                if (pb) {
+                    memcpy(pb->payload, i1_buf, i1_len);
+                    udp_sendto(pcb, pb, ip, port);
+                    pbuf_free(pb);
+                }
+            }
+            free(i1_buf);
+        }
+    }
+
+    for (uint16_t i = 0; i < g_awg_cfg.jc; i++) {
+        uint16_t jmin = g_awg_cfg.jmin > 0 ? g_awg_cfg.jmin : 40;
+        uint16_t jmax = g_awg_cfg.jmax >= jmin ? g_awg_cfg.jmax : jmin;
+        if (jmax > 1200) jmax = 1200;
+        uint16_t jlen = (uint16_t)awg_rand_range(jmin, jmax);
+        struct pbuf *jpb = pbuf_alloc(PBUF_TRANSPORT, jlen, PBUF_RAM);
+        if (jpb) {
+            esp_fill_random(jpb->payload, jlen);
+            udp_sendto(pcb, jpb, ip, port);
+            pbuf_free(jpb);
+        }
+    }
+}
+
+/* --- CLI-команды --- */
+
+static void parse_h_range(const char *val, uint32_t *min_out, uint32_t *max_out) {
+    const char *dash = strchr(val, '-');
+    if (dash) {
+        *min_out = (uint32_t)strtoul(val, NULL, 10);
+        *max_out = (uint32_t)strtoul(dash + 1, NULL, 10);
+        if (*max_out < *min_out) *max_out = *min_out;
+    } else {
+        *min_out = *max_out = (uint32_t)strtoul(val, NULL, 10);
+    }
+}
+
+static bool ensure_time(void) {
+    const time_t valid_after = 1700000000;
+    if (time(NULL) > valid_after) return true;
+
+    ip_addr_t dns_fallback;
+    IP_ADDR4(&dns_fallback, 1, 1, 1, 1);
+    dns_setserver(1, &dns_fallback);
+
+    if (esp_sntp_enabled()) {
+        esp_sntp_stop();
+    }
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+
+    for (int i = 0; i < 40; i++) {
+        if (time(NULL) > valid_after) return true;
         vTaskDelay(pdMS_TO_TICKS(200));
     }
-    return false;
+
+    struct timeval tv = { .tv_sec = 1793750000 + (esp_random() % 60000), .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    return true;
 }
 
-/* esp_netif recomputes netif_default on every uplink GOT_IP (DHCP renewals too),
- * so re-assert the tunnel as default route while it is up. */
-static void ip_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (wg_active && wg_ctx.netif) {
-        esp_wireguard_set_default(&wg_ctx);
-    }
-}
-
-static int cmd_awg_param(int argc, char **argv)
-{
+static int cmd_awg_param(int argc, char **argv) {
     if (argc < 3) {
-        printf("Usage: awg_param <key> <value>\n");
+        printf("AWG_ERROR: BAD_ARGS\n");
+        fflush(stdout);
         return 1;
     }
     const char *k = argv[1];
     const char *v = argv[2];
 
-    if (!strcmp(k, "privkey"))        copy_str(cfg.privkey, sizeof(cfg.privkey), v);
-    else if (!strcmp(k, "pubkey"))    copy_str(cfg.pubkey, sizeof(cfg.pubkey), v);
-    else if (!strcmp(k, "psk"))       copy_str(cfg.psk, sizeof(cfg.psk), v);
-    else if (!strcmp(k, "ip"))        copy_str(cfg.ip, sizeof(cfg.ip), v);
-    else if (!strcmp(k, "endpoint"))  copy_str(cfg.endpoint, sizeof(cfg.endpoint), v);
-    else if (!strcmp(k, "port"))      cfg.port = atoi(v);
-    else if (awg_set_param(k, v) != 0) {
-        printf("AWG_ERROR: BAD_PARAM %s\n", k);
-        return 1;
+    if (strcmp(k, "privkey") == 0) strncpy(g_awg_cfg.privkey, v, sizeof(g_awg_cfg.privkey) - 1);
+    else if (strcmp(k, "pubkey") == 0) strncpy(g_awg_cfg.pubkey, v, sizeof(g_awg_cfg.pubkey) - 1);
+    else if (strcmp(k, "psk") == 0) strncpy(g_awg_cfg.psk, v, sizeof(g_awg_cfg.psk) - 1);
+    else if (strcmp(k, "hpk") == 0) {
+        g_awg_cfg.hpk_set = awg_base64_decode_32(v, g_awg_cfg.hpk);
     }
+    else if (strcmp(k, "ip") == 0) {
+        strncpy(g_awg_cfg.ip, v, sizeof(g_awg_cfg.ip) - 1);
+        char *slash = strchr(g_awg_cfg.ip, '/');
+        if (slash) *slash = '\0';
+    }
+    else if (strcmp(k, "endpoint") == 0) strncpy(g_awg_cfg.endpoint, v, sizeof(g_awg_cfg.endpoint) - 1);
+    else if (strcmp(k, "port") == 0) g_awg_cfg.port = atoi(v);
+    else if (strcmp(k, "jc") == 0) g_awg_cfg.jc = (uint16_t)atoi(v);
+    else if (strcmp(k, "jmin") == 0) g_awg_cfg.jmin = (uint16_t)atoi(v);
+    else if (strcmp(k, "jmax") == 0) g_awg_cfg.jmax = (uint16_t)atoi(v);
+    else if (strcmp(k, "s1") == 0) g_awg_cfg.s1 = (uint16_t)atoi(v);
+    else if (strcmp(k, "s2") == 0) g_awg_cfg.s2 = (uint16_t)atoi(v);
+    else if (strcmp(k, "s3") == 0) g_awg_cfg.s3 = (uint16_t)atoi(v);
+    else if (strcmp(k, "s4") == 0) g_awg_cfg.s4 = (uint16_t)atoi(v);
+    else if (strcmp(k, "h1") == 0) parse_h_range(v, &g_awg_cfg.h1_min, &g_awg_cfg.h1_max);
+    else if (strcmp(k, "h2") == 0) parse_h_range(v, &g_awg_cfg.h2_min, &g_awg_cfg.h2_max);
+    else if (strcmp(k, "h3") == 0) parse_h_range(v, &g_awg_cfg.h3_min, &g_awg_cfg.h3_max);
+    else if (strcmp(k, "h4") == 0) parse_h_range(v, &g_awg_cfg.h4_min, &g_awg_cfg.h4_max);
+    else if (strcmp(k, "i1_clear") == 0) g_awg_cfg.i1[0] = '\0';
+
     printf("AWG_PARAM_OK: %s\n", k);
+    fflush(stdout);
     return 0;
 }
 
-static int cmd_awg_i1(int argc, char **argv)
-{
-    if (argc >= 2 && !strcmp(argv[1], "clear")) {
-        awg_i1_clear();
+static int cmd_awg_i1_chunk(int argc, char **argv) {
+    if (argc < 2) return 1;
+    size_t cur_len = strlen(g_awg_cfg.i1);
+    for (int a = 1; a < argc; a++) {
+        if (a > 1 && cur_len + 1 < sizeof(g_awg_cfg.i1) - 1) {
+            g_awg_cfg.i1[cur_len++] = ' ';
+            g_awg_cfg.i1[cur_len] = '\0';
+        }
+        const char *src = argv[a];
+        while (*src && cur_len < sizeof(g_awg_cfg.i1) - 1) {
+            g_awg_cfg.i1[cur_len++] = (*src == '~') ? ' ' : *src;
+            src++;
+        }
+        g_awg_cfg.i1[cur_len] = '\0';
+    }
+    printf("AWG_I1_LEN: %u\n", (unsigned)cur_len);
+    fflush(stdout);
+    return 0;
+}
+
+static int cmd_awg_i1(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
+        g_awg_cfg.i1[0] = '\0';
         printf("AWG_I1_OK: cleared\n");
+        fflush(stdout);
         return 0;
     }
-    if (argc >= 3 && !strcmp(argv[1], "add")) {
-        if (awg_i1_append(argv[2]) != 0) {
+    if (argc >= 3 && strcmp(argv[1], "add") == 0) {
+        size_t cur_len = strlen(g_awg_cfg.i1);
+        size_t add_len = strlen(argv[2]);
+        if (cur_len + add_len >= sizeof(g_awg_cfg.i1) - 1) {
             printf("AWG_ERROR: I1_TOO_LONG\n");
+            fflush(stdout);
             return 1;
         }
-        printf("AWG_I1_OK: %u\n", (unsigned)strlen(g_awg.i1));
+        strcat(g_awg_cfg.i1, argv[2]);
+        printf("AWG_I1_OK: %u\n", (unsigned)strlen(g_awg_cfg.i1));
+        fflush(stdout);
         return 0;
     }
-    printf("Usage: awg_i1 clear | awg_i1 add \"<chunk>\"\n");
+    printf("AWG_ERROR: BAD_I1_CMD\n");
+    fflush(stdout);
     return 1;
 }
 
-static int cmd_awg_up(int argc, char **argv)
-{
+static int cmd_awg_up(int argc, char **argv) {
     if (wg_active) {
         printf("AWG_STATUS: ALREADY_RUNNING\n");
+        fflush(stdout);
         return 0;
     }
-    if (!cfg.privkey[0] || !cfg.pubkey[0] || !cfg.ip[0] || !cfg.endpoint[0]) {
-        printf("AWG_ERROR: MISSING_PARAMS (need privkey pubkey ip endpoint)\n");
-        return 1;
-    }
-    if (!ensure_time()) {
-        printf("AWG_ERROR: NO_TIME (is the uplink Wi-Fi connected?)\n");
+    if (!g_awg_cfg.privkey[0] || !g_awg_cfg.pubkey[0] || !g_awg_cfg.ip[0] || !g_awg_cfg.endpoint[0]) {
+        printf("AWG_ERROR: MISSING_PARAMS\n");
+        fflush(stdout);
         return 1;
     }
 
-    wireguard_config_t tmp = ESP_WIREGUARD_CONFIG_DEFAULT();
-    wg_config = tmp;
-    wg_config.private_key = cfg.privkey;
-    wg_config.public_key = cfg.pubkey;
-    wg_config.preshared_key = cfg.psk[0] ? cfg.psk : NULL;
-    wg_config.allowed_ip = cfg.ip;
-    wg_config.allowed_ip_mask = "255.255.255.0";
-    wg_config.endpoint = cfg.endpoint;
-    wg_config.port = cfg.port;
-    wg_config.persistent_keepalive = 25;
-
-    memset(&wg_ctx, 0, sizeof(wg_ctx));
-    if (esp_wireguard_init(&wg_config, &wg_ctx) != ESP_OK) {
-        printf("AWG_ERROR: INIT_FAILED\n");
-        return 1;
-    }
-    if (esp_wireguard_connect(&wg_ctx) != ESP_OK) {
-        printf("AWG_ERROR: CONNECT_FAILED\n");
-        esp_wireguard_disconnect(&wg_ctx);
-        return 1;
+    if (orig_default_netif == NULL && netif_default != NULL) {
+        orig_default_netif = netif_default;
     }
 
-    /* wait for the handshake to complete */
+    ensure_time();
+
+    if (!wg_inited) {
+        wireguard_config_t tmp = ESP_WIREGUARD_CONFIG_DEFAULT();
+        wg_config = tmp;
+        wg_config.private_key = g_awg_cfg.privkey;
+        wg_config.public_key = g_awg_cfg.pubkey;
+        wg_config.preshared_key = g_awg_cfg.psk[0] ? g_awg_cfg.psk : NULL;
+        wg_config.allowed_ip = g_awg_cfg.ip;
+        wg_config.allowed_ip_mask = "255.255.255.0";
+        wg_config.endpoint = g_awg_cfg.endpoint;
+        wg_config.port = g_awg_cfg.port;
+        wg_config.persistent_keepalive = 25;
+
+        memset(&wg_ctx, 0, sizeof(wg_ctx));
+        if (esp_wireguard_init(&wg_config, &wg_ctx) != ESP_OK) {
+            printf("AWG_ERROR: INIT_FAILED\n");
+            fflush(stdout);
+            return 1;
+        }
+        if (esp_wireguard_connect(&wg_ctx) != ESP_OK) {
+            printf("AWG_ERROR: CONNECT_FAILED\n");
+            fflush(stdout);
+            return 1;
+        }
+        wg_inited = true;
+    }
+
     bool up = false;
-    for (int i = 0; i < 100; i++) { /* up to 20 s */
+    for (int i = 0; i < 90; i++) { /* ждём рукопожатие до 18 секунд */
         if (esp_wireguardif_peer_is_up(&wg_ctx) == ESP_OK) {
             up = true;
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+
     if (!up) {
-        esp_wireguard_disconnect(&wg_ctx);
-        printf("AWG_ERROR: HANDSHAKE_TIMEOUT\n");
+        /* Не вызываем esp_wireguard_disconnect, чтобы не ронять таймер lwIP */
+        printf("AWG_ERROR: HANDSHAKE_TIMEOUT (hpk=%d)\n", g_awg_cfg.hpk_set ? 1 : 0);
+        fflush(stdout);
         return 1;
     }
 
-    esp_wireguard_set_default(&wg_ctx);
-    wg_active = true;
-
-    if (!handler_registered) {
-        if (esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_cb, NULL) == ESP_OK) {
-            handler_registered = true;
-        }
+    if (wg_ctx.netif) {
+        wg_ctx.netif->mtu = 1320;
+        netif_set_default(wg_ctx.netif);
+        ip_napt_enable(wg_ctx.netif->ip_addr.u_addr.ip4.addr, 1);
     }
+
+    ip_addr_t dns_srv;
+    IP_ADDR4(&dns_srv, 1, 1, 1, 1);
+    dns_setserver(0, &dns_srv);
+
+    wg_active = true;
     printf("AWG_STATUS: CONNECTED\n");
+    fflush(stdout);
     return 0;
 }
 
-static int cmd_awg_down(int argc, char **argv)
-{
-    if (!wg_active) {
-        printf("AWG_STATUS: ALREADY_STOPPED\n");
-        return 0;
+static int cmd_awg_down(int argc, char **argv) {
+    if (orig_default_netif != NULL) {
+        netif_set_default(orig_default_netif);
     }
     wg_active = false;
-    esp_wireguard_disconnect(&wg_ctx); /* restores the previous default netif */
     printf("AWG_STATUS: DISCONNECTED\n");
+    fflush(stdout);
     return 0;
 }
 
-static int cmd_awg_wipe(int argc, char **argv)
-{
-    if (wg_active) {
-        cmd_awg_down(0, NULL);
+static int cmd_awg_wipe(int argc, char **argv) {
+    if (orig_default_netif != NULL) {
+        netif_set_default(orig_default_netif);
     }
-    mbedtls_platform_zeroize(&cfg, sizeof(cfg));
-    cfg.port = 51820;
-    awg_wipe();
+    wg_active = false;
+    mbedtls_platform_zeroize(&g_awg_cfg, sizeof(g_awg_cfg));
+    g_awg_cfg.port = 51820;
+    g_awg_cfg.h1_min = g_awg_cfg.h1_max = 1;
+    g_awg_cfg.h2_min = g_awg_cfg.h2_max = 2;
+    g_awg_cfg.h3_min = g_awg_cfg.h3_max = 3;
+    g_awg_cfg.h4_min = g_awg_cfg.h4_max = 4;
     printf("AWG_STATUS: RAM_WIPED\n");
+    fflush(stdout);
     return 0;
 }
 
-static int cmd_awg_status(int argc, char **argv)
-{
-    bool up = wg_active && esp_wireguardif_peer_is_up(&wg_ctx) == ESP_OK;
-    printf("AWG_STATUS: %s peer_up=%d time_ok=%d i1_len=%u\n",
-           wg_active ? "ACTIVE" : "STOPPED", up, time(NULL) > 1700000000,
-           g_awg.i1 ? (unsigned)strlen(g_awg.i1) : 0u);
+static int cmd_awg_status(int argc, char **argv) {
+    bool up = wg_inited && (esp_wireguardif_peer_is_up(&wg_ctx) == ESP_OK);
+    printf("AWG_STATUS: %s peer_up=%d time_ok=%d hpk=%d i1_len=%u\n",
+           wg_active ? "ACTIVE" : "STOPPED",
+           up ? 1 : 0,
+           (time(NULL) > 1700000000) ? 1 : 0,
+           g_awg_cfg.hpk_set ? 1 : 0,
+           (unsigned)strlen(g_awg_cfg.i1));
+    fflush(stdout);
     return 0;
 }
 
-/* Call from app_main() after register_router(); */
-void register_awg_commands(void)
-{
+void register_awg_commands(void) {
     const esp_console_cmd_t cmds[] = {
-        { .command = "awg_param",  .help = "Set AmneziaWG parameter (RAM only)", .func = &cmd_awg_param },
-        { .command = "awg_i1",     .help = "awg_i1 clear | add \"<chunk>\"",      .func = &cmd_awg_i1 },
-        { .command = "awg_up",     .help = "Start AmneziaWG tunnel",             .func = &cmd_awg_up },
-        { .command = "awg_down",   .help = "Stop tunnel, restore direct route",  .func = &cmd_awg_down },
-        { .command = "awg_wipe",   .help = "Stop tunnel and wipe RAM config",    .func = &cmd_awg_wipe },
-        { .command = "awg_status", .help = "Show tunnel status",                 .func = &cmd_awg_status },
+        { .command = "awg_param",    .help = "Set AmneziaWG parameter (RAM only)", .func = &cmd_awg_param },
+        { .command = "awg_i1",       .help = "awg_i1 clear | add \"<chunk>\"",      .func = &cmd_awg_i1 },
+        { .command = "awg_i1_chunk", .help = "Append I1 CPS signature",            .func = &cmd_awg_i1_chunk },
+        { .command = "awg_up",       .help = "Start AmneziaWG tunnel",             .func = &cmd_awg_up },
+        { .command = "awg_down",     .help = "Stop tunnel, restore direct route",  .func = &cmd_awg_down },
+        { .command = "awg_wipe",     .help = "Stop tunnel and wipe RAM config",    .func = &cmd_awg_wipe },
+        { .command = "awg_status",   .help = "Show tunnel status",                 .func = &cmd_awg_status },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));

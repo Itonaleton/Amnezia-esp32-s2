@@ -36,7 +36,7 @@ jobs:
           wg_c_path = wg_c_matches[0]
           wgif_c_path = wgif_c_matches[0]
 
-          # 1. Патчим wireguard.c (заголовки H1-H4 без затирания reserved_zero)
+          # 1. Патчим wireguard.c (заголовки H1-H4 без обнуления dst->reserved_zero)
           with open(wg_c_path, "r") as f:
               wg_c = f.read()
 
@@ -55,7 +55,7 @@ jobs:
           wg_c = '#include "wireguard.h"\n' + extern_decl + wg_c.replace('#include "wireguard.h"', '', 1)
 
           new_get_type = """uint8_t wireguard_get_message_type(const uint8_t *data, size_t len) {
-              if (len >= 4) {
+              if (data != NULL && len >= 4) {
                   if (len == sizeof(struct message_handshake_initiation) && awg_check_h1(data)) return MESSAGE_HANDSHAKE_INITIATION;
                   if (len == sizeof(struct message_handshake_response) && awg_check_h2(data)) return MESSAGE_HANDSHAKE_RESPONSE;
                   if (len == sizeof(struct message_cookie_reply) && awg_check_h3(data)) return MESSAGE_COOKIE_REPLY;
@@ -75,9 +75,9 @@ jobs:
           wg_c = wg_c.replace("if (src->type == MESSAGE_HANDSHAKE_RESPONSE)", "if (awg_check_h2(&src->type))")
           wg_c = wg_c.replace("if (src->type == MESSAGE_COOKIE_REPLY)", "if (awg_check_h3(&src->type))")
 
-          wg_c = wg_c.replace("reserved_zero[0] = 0;", "")
-          wg_c = wg_c.replace("reserved_zero[1] = 0;", "")
-          wg_c = wg_c.replace("reserved_zero[2] = 0;", "")
+          wg_c = wg_c.replace("dst->reserved_zero[0] = 0;", "")
+          wg_c = wg_c.replace("dst->reserved_zero[1] = 0;", "")
+          wg_c = wg_c.replace("dst->reserved_zero[2] = 0;", "")
           wg_c = wg_c.replace("(src->reserved_zero[0] == 0) && (src->reserved_zero[1] == 0) && (src->reserved_zero[2] == 0)", "true")
           wg_c = wg_c.replace("(msg->reserved_zero[0] == 0) && (msg->reserved_zero[1] == 0) && (msg->reserved_zero[2] == 0)", "true")
 
@@ -103,6 +103,7 @@ jobs:
           wgif_c = '#include "wireguardif.h"\n' + wgif_extern + wgif_c.replace('#include "wireguardif.h"', '', 1)
 
           new_dev_out = """static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
+              if (!device || !device->udp_pcb || !q || !q->payload || !ipaddr) return ERR_ARG;
               uint16_t s_len = awg_get_tx_prefix_len((const uint8_t *)q->payload, q->tot_len);
               if (s_len > 0) {
                   struct pbuf *awg_pb = pbuf_alloc(PBUF_TRANSPORT, s_len + q->tot_len, PBUF_RAM);
@@ -137,7 +138,7 @@ jobs:
 
           wgif_c = wgif_c.replace(
               "size_t len = p->len;",
-              "size_t len = p->len;\n\t\tawg_strip_rx_prefix(&data, &len);"
+              "size_t len = p->len;\n\t\tawg_strip_rx_prefix(&data, &len);\n\t\tp->len = p->tot_len = len;"
           )
 
           with open(wgif_c_path, "w") as f:

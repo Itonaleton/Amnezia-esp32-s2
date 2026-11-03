@@ -58,7 +58,7 @@ static bool wg_active = false;
 static struct netif *orig_default_netif = NULL;
 static uint32_t awg_pkt_counter = 0;
 
-/* --- Встроенный потоковый шифр ChaCha20 IETF (для HeaderProtectionKey в AmneziaWG 3.0/3.1) --- */
+/* --- Потоковый шифр ChaCha20 IETF (для HeaderProtectionKey) --- */
 
 #define AWG_ROTL32(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
 #define AWG_QR(a, b, c, d) do { \
@@ -69,10 +69,12 @@ static uint32_t awg_pkt_counter = 0;
 } while (0)
 
 static uint32_t awg_read_u32_le(const uint8_t *p) {
+    if (!p) return 0;
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 static void awg_write_u32_le(uint8_t *p, uint32_t v) {
+    if (!p) return;
     p[0] = (uint8_t)(v & 0xFF);
     p[1] = (uint8_t)((v >> 8) & 0xFF);
     p[2] = (uint8_t)((v >> 16) & 0xFF);
@@ -120,8 +122,8 @@ static void awg_chacha20_xor(uint8_t *buf, size_t len, const uint8_t key[32], co
     }
 }
 
-/* Декодер Base64 для 32-байтного ключа HeaderProtectionKey */
 static bool awg_base64_decode_32(const char *in, uint8_t out[32]) {
+    if (!in) return false;
     uint32_t val = 0;
     int valb = -8;
     size_t out_len = 0;
@@ -144,8 +146,6 @@ static bool awg_base64_decode_32(const char *in, uint8_t out[32]) {
     return (out_len == 32);
 }
 
-/* --- Функции обфускации заголовков H1..H4 и префиксов S1..S4 --- */
-
 static uint32_t awg_rand_range(uint32_t min_v, uint32_t max_v) {
     if (max_v <= min_v) return min_v;
     return min_v + (esp_random() % (max_v - min_v + 1));
@@ -162,7 +162,7 @@ bool awg_check_h3(const uint8_t *p) { uint32_t v = awg_read_u32_le(p); return (v
 bool awg_check_h4(const uint8_t *p) { uint32_t v = awg_read_u32_le(p); return (v >= g_awg_cfg.h4_min && v <= g_awg_cfg.h4_max); }
 
 uint16_t awg_get_tx_prefix_len(const uint8_t *data, size_t len) {
-    if (len < 4) return 0;
+    if (!data || len < 4) return 0;
     if (len == 148 && awg_check_h1(data)) return g_awg_cfg.s1;
     if (len == 92  && awg_check_h2(data)) return g_awg_cfg.s2;
     if (len == 64  && awg_check_h3(data)) return g_awg_cfg.s3;
@@ -170,9 +170,8 @@ uint16_t awg_get_tx_prefix_len(const uint8_t *data, size_t len) {
     return 0;
 }
 
-/* Шифрование заголовка при отправке пакета (вызывается из wireguardif_device_output) */
 void awg_apply_tx_header_protection(uint8_t *full_pkt, uint16_t s_len, size_t wg_len) {
-    if (!g_awg_cfg.hpk_set || s_len < 12) return;
+    if (!full_pkt || !g_awg_cfg.hpk_set || s_len < 12) return;
     uint8_t *wg_hdr = full_pkt + s_len;
     if (wg_len == 148 || wg_len == 92 || wg_len == 64) {
         awg_chacha20_xor(wg_hdr, wg_len, g_awg_cfg.hpk, full_pkt);
@@ -181,23 +180,22 @@ void awg_apply_tx_header_protection(uint8_t *full_pkt, uint16_t s_len, size_t wg
     }
 }
 
-/* Расшифровка HeaderProtectionKey и снятие префикса S1..S4 при приёме пакета */
+/* Безопасное снятие префикса S1..S4 через memmove (сохраняет 4-байтное выравнивание на ESP32-S2) */
 void awg_strip_rx_prefix(uint8_t **data, size_t *len) {
+    if (!data || !*data || !len) return;
     uint8_t *d = *data;
     size_t l = *len;
 
-    if (g_awg_cfg.hpk_set) {
+    if (g_awg_cfg.hpk_set && l >= 16) {
         uint8_t ks_probe[4] = {0, 0, 0, 0};
-        if (l >= 16) {
-            awg_chacha20_xor(ks_probe, 4, g_awg_cfg.hpk, d);
-        }
+        awg_chacha20_xor(ks_probe, 4, g_awg_cfg.hpk, d);
         uint32_t mask = awg_read_u32_le(ks_probe);
 
         if (g_awg_cfg.s1 >= 12 && l >= (size_t)(g_awg_cfg.s1 + 148)) {
             uint32_t h = awg_read_u32_le(d + g_awg_cfg.s1) ^ mask;
             if (h >= g_awg_cfg.h1_min && h <= g_awg_cfg.h1_max) {
                 awg_chacha20_xor(d + g_awg_cfg.s1, 148, g_awg_cfg.hpk, d);
-                *data = d + g_awg_cfg.s1;
+                memmove(d, d + g_awg_cfg.s1, 148);
                 *len = 148;
                 return;
             }
@@ -206,7 +204,7 @@ void awg_strip_rx_prefix(uint8_t **data, size_t *len) {
             uint32_t h = awg_read_u32_le(d + g_awg_cfg.s2) ^ mask;
             if (h >= g_awg_cfg.h2_min && h <= g_awg_cfg.h2_max) {
                 awg_chacha20_xor(d + g_awg_cfg.s2, 92, g_awg_cfg.hpk, d);
-                *data = d + g_awg_cfg.s2;
+                memmove(d, d + g_awg_cfg.s2, 92);
                 *len = 92;
                 return;
             }
@@ -215,7 +213,7 @@ void awg_strip_rx_prefix(uint8_t **data, size_t *len) {
             uint32_t h = awg_read_u32_le(d + g_awg_cfg.s3) ^ mask;
             if (h >= g_awg_cfg.h3_min && h <= g_awg_cfg.h3_max) {
                 awg_chacha20_xor(d + g_awg_cfg.s3, 64, g_awg_cfg.hpk, d);
-                *data = d + g_awg_cfg.s3;
+                memmove(d, d + g_awg_cfg.s3, 64);
                 *len = 64;
                 return;
             }
@@ -224,8 +222,9 @@ void awg_strip_rx_prefix(uint8_t **data, size_t *len) {
             uint32_t h = awg_read_u32_le(d + g_awg_cfg.s4) ^ mask;
             if (h >= g_awg_cfg.h4_min && h <= g_awg_cfg.h4_max) {
                 awg_chacha20_xor(d + g_awg_cfg.s4, 16, g_awg_cfg.hpk, d);
-                *data = d + g_awg_cfg.s4;
-                *len = l - g_awg_cfg.s4;
+                size_t new_len = l - g_awg_cfg.s4;
+                memmove(d, d + g_awg_cfg.s4, new_len);
+                *len = new_len;
                 return;
             }
         }
@@ -233,13 +232,18 @@ void awg_strip_rx_prefix(uint8_t **data, size_t *len) {
     }
 
     if (l == (size_t)(g_awg_cfg.s1 + 148) && awg_check_h1(d + g_awg_cfg.s1)) {
-        *data += g_awg_cfg.s1; *len -= g_awg_cfg.s1;
+        if (g_awg_cfg.s1 > 0) memmove(d, d + g_awg_cfg.s1, 148);
+        *len = 148;
     } else if (l == (size_t)(g_awg_cfg.s2 + 92) && awg_check_h2(d + g_awg_cfg.s2)) {
-        *data += g_awg_cfg.s2; *len -= g_awg_cfg.s2;
+        if (g_awg_cfg.s2 > 0) memmove(d, d + g_awg_cfg.s2, 92);
+        *len = 92;
     } else if (l == (size_t)(g_awg_cfg.s3 + 64) && awg_check_h3(d + g_awg_cfg.s3)) {
-        *data += g_awg_cfg.s3; *len -= g_awg_cfg.s3;
+        if (g_awg_cfg.s3 > 0) memmove(d, d + g_awg_cfg.s3, 64);
+        *len = 64;
     } else if (l >= (size_t)(g_awg_cfg.s4 + 32) && awg_check_h4(d + g_awg_cfg.s4)) {
-        *data += g_awg_cfg.s4; *len -= g_awg_cfg.s4;
+        size_t new_len = l - g_awg_cfg.s4;
+        if (g_awg_cfg.s4 > 0) memmove(d, d + g_awg_cfg.s4, new_len);
+        *len = new_len;
     }
 }
 
@@ -504,6 +508,8 @@ static int cmd_awg_up(int argc, char **argv) {
         wg_config.persistent_keepalive = 25;
 
         memset(&wg_ctx, 0, sizeof(wg_ctx));
+        wg_ctx.netif_default = orig_default_netif;
+
         if (esp_wireguard_init(&wg_config, &wg_ctx) != ESP_OK) {
             printf("AWG_ERROR: INIT_FAILED\n");
             fflush(stdout);
@@ -518,7 +524,7 @@ static int cmd_awg_up(int argc, char **argv) {
     }
 
     bool up = false;
-    for (int i = 0; i < 90; i++) { /* ждём рукопожатие до 18 секунд */
+    for (int i = 0; i < 90; i++) {
         if (esp_wireguardif_peer_is_up(&wg_ctx) == ESP_OK) {
             up = true;
             break;
@@ -527,7 +533,6 @@ static int cmd_awg_up(int argc, char **argv) {
     }
 
     if (!up) {
-        /* Не вызываем esp_wireguard_disconnect, чтобы не ронять таймер lwIP */
         printf("AWG_ERROR: HANDSHAKE_TIMEOUT (hpk=%d)\n", g_awg_cfg.hpk_set ? 1 : 0);
         fflush(stdout);
         return 1;

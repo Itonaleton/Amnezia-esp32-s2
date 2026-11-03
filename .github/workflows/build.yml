@@ -16,8 +16,133 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install PlatformIO
-        run: pip install platformio
+      - name: Install PlatformIO and esptool
+        run: pip install platformio esptool
+
+      - name: Clone and Patch esp_wireguard for AmneziaWG 3.x
+        run: |
+          rm -f src/idf_component.yml idf_component.yml
+          rm -rf components/esp_wireguard
+          git clone --recursive https://github.com/trombik/esp_wireguard.git components/esp_wireguard
+          python3 - << 'EOF'
+          import glob, re, sys
+
+          wg_c_matches = glob.glob("components/esp_wireguard/**/wireguard.c", recursive=True)
+          wgif_c_matches = glob.glob("components/esp_wireguard/**/wireguardif.c", recursive=True)
+
+          if not wg_c_matches or not wgif_c_matches:
+              sys.exit(1)
+
+          wg_c_path = wg_c_matches[0]
+          wgif_c_path = wgif_c_matches[0]
+
+          # 1. Патчим wireguard.c (заголовки H1-H4 без затирания reserved_zero)
+          with open(wg_c_path, "r") as f:
+              wg_c = f.read()
+
+          extern_decl = """
+          #include <stdbool.h>
+          #include <stdint.h>
+          extern void awg_write_h1(uint8_t *p);
+          extern void awg_write_h2(uint8_t *p);
+          extern void awg_write_h3(uint8_t *p);
+          extern void awg_write_h4(uint8_t *p);
+          extern bool awg_check_h1(const uint8_t *p);
+          extern bool awg_check_h2(const uint8_t *p);
+          extern bool awg_check_h3(const uint8_t *p);
+          extern bool awg_check_h4(const uint8_t *p);
+          """
+          wg_c = '#include "wireguard.h"\n' + extern_decl + wg_c.replace('#include "wireguard.h"', '', 1)
+
+          new_get_type = """uint8_t wireguard_get_message_type(const uint8_t *data, size_t len) {
+              if (len >= 4) {
+                  if (len == sizeof(struct message_handshake_initiation) && awg_check_h1(data)) return MESSAGE_HANDSHAKE_INITIATION;
+                  if (len == sizeof(struct message_handshake_response) && awg_check_h2(data)) return MESSAGE_HANDSHAKE_RESPONSE;
+                  if (len == sizeof(struct message_cookie_reply) && awg_check_h3(data)) return MESSAGE_COOKIE_REPLY;
+                  if (len >= sizeof(struct message_transport_data) + WIREGUARD_AUTHTAG_LEN && awg_check_h4(data)) return MESSAGE_TRANSPORT_DATA;
+              }
+              return MESSAGE_INVALID;
+          }"""
+
+          wg_c = re.sub(
+              r"uint8_t\s+wireguard_get_message_type\s*\([^)]*\)\s*\{.*?\n\}",
+              new_get_type,
+              wg_c,
+              flags=re.DOTALL
+          )
+
+          wg_c = wg_c.replace("if (msg->type == MESSAGE_HANDSHAKE_INITIATION)", "if (awg_check_h1(&msg->type))")
+          wg_c = wg_c.replace("if (src->type == MESSAGE_HANDSHAKE_RESPONSE)", "if (awg_check_h2(&src->type))")
+          wg_c = wg_c.replace("if (src->type == MESSAGE_COOKIE_REPLY)", "if (awg_check_h3(&src->type))")
+
+          wg_c = wg_c.replace("reserved_zero[0] = 0;", "")
+          wg_c = wg_c.replace("reserved_zero[1] = 0;", "")
+          wg_c = wg_c.replace("reserved_zero[2] = 0;", "")
+          wg_c = wg_c.replace("(src->reserved_zero[0] == 0) && (src->reserved_zero[1] == 0) && (src->reserved_zero[2] == 0)", "true")
+          wg_c = wg_c.replace("(msg->reserved_zero[0] == 0) && (msg->reserved_zero[1] == 0) && (msg->reserved_zero[2] == 0)", "true")
+
+          wg_c = wg_c.replace("dst->type = MESSAGE_HANDSHAKE_INITIATION;", "awg_write_h1(&dst->type);")
+          wg_c = wg_c.replace("dst->type = MESSAGE_HANDSHAKE_RESPONSE;", "awg_write_h2(&dst->type);")
+          wg_c = wg_c.replace("dst->type = MESSAGE_COOKIE_REPLY;", "awg_write_h3(&dst->type);")
+
+          with open(wg_c_path, "w") as f:
+              f.write(wg_c)
+
+          # 2. Патчим wireguardif.c (S1-S4, HeaderProtectionKey, I1, Jc и H4)
+          with open(wgif_c_path, "r") as f:
+              wgif_c = f.read()
+
+          wgif_extern = """
+          #include "esp_random.h"
+          extern void awg_write_h4(uint8_t *p);
+          extern uint16_t awg_get_tx_prefix_len(const uint8_t *data, size_t len);
+          extern void awg_apply_tx_header_protection(uint8_t *full_pkt, uint16_t s_len, size_t wg_len);
+          extern void awg_strip_rx_prefix(uint8_t **data, size_t *len);
+          extern void awg_send_pre_handshake(struct udp_pcb *pcb, const ip_addr_t *ip, uint16_t port);
+          """
+          wgif_c = '#include "wireguardif.h"\n' + wgif_extern + wgif_c.replace('#include "wireguardif.h"', '', 1)
+
+          new_dev_out = """static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
+              uint16_t s_len = awg_get_tx_prefix_len((const uint8_t *)q->payload, q->tot_len);
+              if (s_len > 0) {
+                  struct pbuf *awg_pb = pbuf_alloc(PBUF_TRANSPORT, s_len + q->tot_len, PBUF_RAM);
+                  if (awg_pb) {
+                      esp_fill_random(awg_pb->payload, s_len);
+                      pbuf_copy_partial(q, (uint8_t *)awg_pb->payload + s_len, q->tot_len, 0);
+                      awg_apply_tx_header_protection((uint8_t *)awg_pb->payload, s_len, q->tot_len);
+                      err_t err = udp_sendto(device->udp_pcb, awg_pb, ipaddr, port);
+                      pbuf_free(awg_pb);
+                      return err;
+                  }
+              }
+              return udp_sendto(device->udp_pcb, q, ipaddr, port);
+          }"""
+
+          wgif_c = re.sub(
+              r"static\s+err_t\s+wireguardif_device_output\s*\([^)]*\)\s*\{.*?\n\}",
+              new_dev_out,
+              wgif_c,
+              flags=re.DOTALL
+          )
+
+          wgif_c = wgif_c.replace("header->reserved_zero[0] = 0;", "")
+          wgif_c = wgif_c.replace("header->reserved_zero[1] = 0;", "")
+          wgif_c = wgif_c.replace("header->reserved_zero[2] = 0;", "")
+          wgif_c = wgif_c.replace("header->type = MESSAGE_TRANSPORT_DATA;", "awg_write_h4(&header->type);")
+
+          wgif_c = wgif_c.replace(
+              "pbuf = wireguardif_initiate_handshake(device, peer, &msg, &err);",
+              "awg_send_pre_handshake(device->udp_pcb, &peer->ip, peer->port);\n\tpbuf = wireguardif_initiate_handshake(device, peer, &msg, &err);"
+          )
+
+          wgif_c = wgif_c.replace(
+              "size_t len = p->len;",
+              "size_t len = p->len;\n\t\tawg_strip_rx_prefix(&data, &len);"
+          )
+
+          with open(wgif_c_path, "w") as f:
+              f.write(wgif_c)
+          EOF
 
       - name: Build
         run: pio run -e esp32-s2
@@ -27,11 +152,21 @@ jobs:
           strings .pio/build/esp32-s2/firmware.bin | grep -q "AmneziaWG commands registered"
           strings .pio/build/esp32-s2/firmware.bin | grep -q "awg_up"
 
+      - name: Merge binaries for 0x0 offset (4MB Flash)
+        run: |
+          esptool.py --chip esp32s2 merge_bin \
+            -o .pio/build/esp32-s2/esp32s2_full_0x0.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            0x1000 .pio/build/esp32-s2/bootloader.bin \
+            0x8000 .pio/build/esp32-s2/partitions.bin \
+            0x10000 .pio/build/esp32-s2/firmware.bin
+
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: firmware-esp32-s2
           path: |
+            .pio/build/esp32-s2/esp32s2_full_0x0.bin
             .pio/build/esp32-s2/bootloader.bin
             .pio/build/esp32-s2/partitions.bin
             .pio/build/esp32-s2/firmware.bin

@@ -24,7 +24,7 @@ jobs:
 
       - name: Verify AmneziaWG is in the binary
         run: |
-          strings .pio/build/esp32-s2/firmware.bin | grep -q "awg_i1"
+          strings .pio/build/esp32-s2/firmware.bin | grep -q "AmneziaWG commands registered"
           strings .pio/build/esp32-s2/firmware.bin | grep -q "awg_up"
 
       - name: Upload firmware

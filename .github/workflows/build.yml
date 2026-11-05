@@ -148,6 +148,20 @@ jobs:
       - name: Build
         run: pio run -e esp32-s2
 
+      - name: Decode crash backtrace
+        continue-on-error: true
+        run: |
+          ELF=.pio/build/esp32-s2/firmware.elf
+          echo "ELF sha256 (first 16): $(sha256sum $ELF | cut -c1-16)"
+          echo "Panic printed:          6a62fb6e01438a74"
+          A2L=$(find ~/.platformio -name 'xtensa-esp32s2-elf-addr2line' | head -1)
+          echo "addr2line: $A2L"
+          echo "---- DECODED BACKTRACE ----"
+          "$A2L" -pfiaC -e "$ELF" \
+            0x400a07ce 0x400a07cb 0x400a08e5 0x400ad0db 0x400ad189 0x400ad2b5 \
+            0x4008e4dc 0x4008e774 0x40084490 0x4008a4cb 0x40086781 0x40145463 0x4002f595
+          echo "---- END ----"
+
       - name: Verify AmneziaWG is in the binary
         run: |
           strings .pio/build/esp32-s2/firmware.bin | grep -q "AmneziaWG commands registered"
@@ -171,3 +185,4 @@ jobs:
             .pio/build/esp32-s2/bootloader.bin
             .pio/build/esp32-s2/partitions.bin
             .pio/build/esp32-s2/firmware.bin
+            .pio/build/esp32-s2/firmware.elf

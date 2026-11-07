@@ -127,15 +127,47 @@ jobs:
               flags=re.DOTALL
           )
 
+          new_peer_out = """static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct wireguard_peer *peer) {
+              struct wireguard_device *device = (struct wireguard_device *)netif->state;
+              if (!device || !device->udp_pcb || !q || !q->payload) return ERR_ARG;
+              uint16_t s_len = awg_get_tx_prefix_len((const uint8_t *)q->payload, q->tot_len);
+              static int awg_dbg_tx = 0;
+              if (awg_dbg_tx < 40) { awg_dbg_tx++; ESP_LOGI("awg_tx", "peer_output %u bytes s_len=%u", (unsigned)q->tot_len, (unsigned)s_len); }
+              if (s_len > 0) {
+                  struct pbuf *awg_pb = pbuf_alloc(PBUF_TRANSPORT, s_len + q->tot_len, PBUF_RAM);
+                  if (awg_pb) {
+                      esp_fill_random(awg_pb->payload, s_len);
+                      pbuf_copy_partial(q, (uint8_t *)awg_pb->payload + s_len, q->tot_len, 0);
+                      awg_apply_tx_header_protection((uint8_t *)awg_pb->payload, s_len, q->tot_len);
+                      err_t err = udp_sendto_if(device->udp_pcb, awg_pb, &peer->ip, peer->port, device->underlying_netif);
+                      pbuf_free(awg_pb);
+                      return err;
+                  }
+              }
+              return udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+          }"""
+
+          wgif_c, n_peer = re.subn(
+              r"static\s+err_t\s+wireguardif_peer_output\s*\([^)]*\)\s*\{.*?\n\}",
+              lambda m: new_peer_out,
+              wgif_c, count=1, flags=re.DOTALL
+          )
+          print("peer_output patched:", n_peer)
+          assert n_peer == 1, "wireguardif_peer_output patch did NOT apply"
+
           wgif_c = wgif_c.replace("header->reserved_zero[0] = 0;", "")
           wgif_c = wgif_c.replace("header->reserved_zero[1] = 0;", "")
           wgif_c = wgif_c.replace("header->reserved_zero[2] = 0;", "")
           wgif_c = wgif_c.replace("header->type = MESSAGE_TRANSPORT_DATA;", "awg_write_h4(&header->type);")
 
-          wgif_c = wgif_c.replace(
-              "pbuf = wireguardif_initiate_handshake(device, peer, &msg, &err);",
-              "awg_send_pre_handshake(device->udp_pcb, &peer->ip, peer->port);\n\tpbuf = wireguardif_initiate_handshake(device, peer, &msg, &err);"
+          # I1 + junk packets before every handshake initiation (regex: variable name differs between versions)
+          wgif_c, n_pre = re.subn(
+              r"(pbuf\s*=\s*wireguardif_initiate_handshake\(\s*device\s*,\s*peer\s*,\s*&msg\s*,\s*&\w+\s*\)\s*;)",
+              r"awg_send_pre_handshake(device->udp_pcb, &peer->ip, peer->port);\n\t\1",
+              wgif_c
           )
+          print("preamble hook patched:", n_pre)
+          assert n_pre >= 1, "awg_send_pre_handshake hook did NOT apply"
 
           wgif_c = wgif_c.replace(
               "size_t len = p->len;",

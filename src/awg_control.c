@@ -493,7 +493,23 @@ static int cmd_awg_up(int argc, char **argv) {
         orig_default_netif = netif_default;
     }
 
+    printf("AWG_CFG: jc=%u jmin=%u jmax=%u s1=%u s2=%u s3=%u s4=%u "
+           "h1=%u-%u h2=%u-%u h3=%u-%u h4=%u-%u hpk=%d i1_len=%u port=%d ep=%s\n",
+           (unsigned)g_awg_cfg.jc, (unsigned)g_awg_cfg.jmin, (unsigned)g_awg_cfg.jmax,
+           (unsigned)g_awg_cfg.s1, (unsigned)g_awg_cfg.s2, (unsigned)g_awg_cfg.s3, (unsigned)g_awg_cfg.s4,
+           (unsigned)g_awg_cfg.h1_min, (unsigned)g_awg_cfg.h1_max,
+           (unsigned)g_awg_cfg.h2_min, (unsigned)g_awg_cfg.h2_max,
+           (unsigned)g_awg_cfg.h3_min, (unsigned)g_awg_cfg.h3_max,
+           (unsigned)g_awg_cfg.h4_min, (unsigned)g_awg_cfg.h4_max,
+           g_awg_cfg.hpk_set ? 1 : 0, (unsigned)strlen(g_awg_cfg.i1),
+           g_awg_cfg.port, g_awg_cfg.endpoint);
+    fflush(stdout);
+    printf("AWG_TIME: before_sync=%lld\n", (long long)time(NULL));
+    fflush(stdout);
     ensure_time();
+    printf("AWG_TIME: after_sync=%lld sntp_status=%d (0=reset 1=completed 2=in_progress)\n",
+           (long long)time(NULL), (int)sntp_get_sync_status());
+    fflush(stdout);
 
     if (!wg_inited) {
         wireguard_config_t tmp = ESP_WIREGUARD_CONFIG_DEFAULT();

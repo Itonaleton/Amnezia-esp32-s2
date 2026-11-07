@@ -105,6 +105,7 @@ jobs:
           new_dev_out = """static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
               if (!device || !device->udp_pcb || !q || !q->payload || !ipaddr) return ERR_ARG;
               uint16_t s_len = awg_get_tx_prefix_len((const uint8_t *)q->payload, q->tot_len);
+              ESP_LOGI("awg_tx", "tx %u bytes s_len=%u port=%u", (unsigned)q->tot_len, (unsigned)s_len, (unsigned)port);
               if (s_len > 0) {
                   struct pbuf *awg_pb = pbuf_alloc(PBUF_TRANSPORT, s_len + q->tot_len, PBUF_RAM);
                   if (awg_pb) {
@@ -138,7 +139,7 @@ jobs:
 
           wgif_c = wgif_c.replace(
               "size_t len = p->len;",
-              "size_t len = p->len;\n\t\tawg_strip_rx_prefix(&data, &len);\n\t\tp->len = p->tot_len = len;"
+              "size_t len = p->len;\n\t\tstatic int awg_dbg_rx = 0;\n\t\tif (awg_dbg_rx < 40) { awg_dbg_rx++; ESP_LOGI(\"awg_rx\", \"rx %u bytes from port %u first4=%02x%02x%02x%02x\", (unsigned)len, (unsigned)port, (unsigned)((uint8_t *)p->payload)[0], (unsigned)(len > 1 ? ((uint8_t *)p->payload)[1] : 0), (unsigned)(len > 2 ? ((uint8_t *)p->payload)[2] : 0), (unsigned)(len > 3 ? ((uint8_t *)p->payload)[3] : 0)); }\n\t\tawg_strip_rx_prefix(&data, &len);\n\t\tif (awg_dbg_rx <= 40) { ESP_LOGI(\"awg_rx\", \"after strip: %u bytes\", (unsigned)len); }\n\t\tp->len = p->tot_len = len;"
           )
 
           with open(wgif_c_path, "w") as f:
@@ -147,20 +148,6 @@ jobs:
 
       - name: Build
         run: pio run -e esp32-s2
-
-      - name: Decode crash backtrace
-        continue-on-error: true
-        run: |
-          ELF=.pio/build/esp32-s2/firmware.elf
-          echo "ELF sha256 (first 16): $(sha256sum $ELF | cut -c1-16)"
-          echo "Panic printed:          6a62fb6e01438a74"
-          A2L=$(find ~/.platformio -name 'xtensa-esp32s2-elf-addr2line' | head -1)
-          echo "addr2line: $A2L"
-          echo "---- DECODED BACKTRACE ----"
-          "$A2L" -pfiaC -e "$ELF" \
-            0x400a07ce 0x400a07cb 0x400a08e5 0x400ad0db 0x400ad189 0x400ad2b5 \
-            0x4008e4dc 0x4008e774 0x40084490 0x4008a4cb 0x40086781 0x40145463 0x4002f595
-          echo "---- END ----"
 
       - name: Verify AmneziaWG is in the binary
         run: |

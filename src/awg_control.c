@@ -173,9 +173,14 @@ uint16_t awg_get_tx_prefix_len(const uint8_t *data, size_t len) {
 void awg_apply_tx_header_protection(uint8_t *full_pkt, uint16_t s_len, size_t wg_len) {
     if (!full_pkt || !g_awg_cfg.hpk_set || s_len < 12) return;
     uint8_t *wg_hdr = full_pkt + s_len;
-    if (wg_len == 148 || wg_len == 92 || wg_len == 64) {
+    /* Decide by message TYPE as well as length: a transport packet can be 64/92/148 bytes long too. */
+    if (wg_len == 148 && awg_check_h1(wg_hdr)) {
         awg_chacha20_xor(wg_hdr, wg_len, g_awg_cfg.hpk, full_pkt);
-    } else if (wg_len >= 32) {
+    } else if (wg_len == 92 && awg_check_h2(wg_hdr)) {
+        awg_chacha20_xor(wg_hdr, wg_len, g_awg_cfg.hpk, full_pkt);
+    } else if (wg_len == 64 && awg_check_h3(wg_hdr)) {
+        awg_chacha20_xor(wg_hdr, wg_len, g_awg_cfg.hpk, full_pkt);
+    } else if (wg_len >= 32 && awg_check_h4(wg_hdr)) {
         awg_chacha20_xor(wg_hdr, 16, g_awg_cfg.hpk, full_pkt);
     }
 }

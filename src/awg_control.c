@@ -6,6 +6,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_console.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -359,6 +360,52 @@ void awg_send_pre_handshake(struct udp_pcb *pcb, const ip_addr_t *ip, uint16_t p
     }
 }
 
+/* Traffic counters (updated from the patched esp_wireguard, shown by awg_status) */
+volatile uint32_t g_awg_tx_ok = 0;
+volatile uint32_t g_awg_tx_fail = 0;
+volatile uint32_t g_awg_rx_pkts = 0;
+
+/* TCP MSS clamping: rewrite the MSS option of IPv4 TCP SYN/SYN-ACK packets so that
+ * segments fit into the tunnel MTU (prevents the classic "small pages load, big ones hang"
+ * problem). TCP checksum is updated incrementally (RFC 1624). */
+void awg_clamp_mss(struct pbuf *q, uint16_t max_mss) {
+    if (!q || !q->payload || q->len < 40) return;
+    uint8_t *ip = (uint8_t *)q->payload;
+    if ((ip[0] >> 4) != 4 || ip[9] != 6) return;           /* IPv4 + TCP only */
+    uint16_t ihl = (uint16_t)((ip[0] & 0x0f) * 4);
+    if (ihl < 20 || q->len < (uint16_t)(ihl + 20)) return;
+    uint8_t *tcp = ip + ihl;
+    if (!(tcp[13] & 0x02)) return;                          /* SYN flag */
+    uint16_t doff = (uint16_t)((tcp[12] >> 4) * 4);
+    if (doff < 24 || q->len < (uint16_t)(ihl + doff)) return;
+    uint8_t *opt = tcp + 20;
+    uint8_t *end = tcp + doff;
+    while (opt < end) {
+        uint8_t kind = opt[0];
+        if (kind == 0) break;
+        if (kind == 1) { opt++; continue; }
+        if (opt + 1 >= end) break;
+        uint8_t olen = opt[1];
+        if (olen < 2 || opt + olen > end) break;
+        if (kind == 2 && olen == 4) {
+            uint16_t mss = (uint16_t)((opt[2] << 8) | opt[3]);
+            if (mss > max_mss) {
+                uint32_t sum = (uint16_t)~(uint16_t)((tcp[16] << 8) | tcp[17]);
+                sum += (uint16_t)~mss;
+                sum += max_mss;
+                while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+                uint16_t csum = (uint16_t)~sum;
+                opt[2] = (uint8_t)(max_mss >> 8);
+                opt[3] = (uint8_t)(max_mss & 0xff);
+                tcp[16] = (uint8_t)(csum >> 8);
+                tcp[17] = (uint8_t)(csum & 0xff);
+            }
+            break;
+        }
+        opt += olen;
+    }
+}
+
 /* --- CLI-команды --- */
 
 static void parse_h_range(const char *val, uint32_t *min_out, uint32_t *max_out) {
@@ -560,7 +607,7 @@ static int cmd_awg_up(int argc, char **argv) {
     }
 
     if (wg_ctx.netif) {
-        wg_ctx.netif->mtu = 1320;
+        wg_ctx.netif->mtu = 1280;
         netif_set_default(wg_ctx.netif);
         /* NAPT stays enabled on the AP (inside) netif only (done in main). Enabling it on the
            tunnel (outside) netif stops reverse translation of replies coming back from the server. */
@@ -614,6 +661,9 @@ static int cmd_awg_status(int argc, char **argv) {
            (time(NULL) > 1700000000) ? 1 : 0,
            g_awg_cfg.hpk_set ? 1 : 0,
            (unsigned)strlen(g_awg_cfg.i1));
+    printf("AWG_STATS: tx_ok=%u tx_fail=%u rx=%u heap=%u min_heap=%u\n",
+           (unsigned)g_awg_tx_ok, (unsigned)g_awg_tx_fail, (unsigned)g_awg_rx_pkts,
+           (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
     fflush(stdout);
     return 0;
 }

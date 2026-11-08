@@ -99,6 +99,8 @@ jobs:
           extern void awg_apply_tx_header_protection(uint8_t *full_pkt, uint16_t s_len, size_t wg_len);
           extern void awg_strip_rx_prefix(uint8_t **data, size_t *len);
           extern void awg_send_pre_handshake(struct udp_pcb *pcb, const ip_addr_t *ip, uint16_t port);
+          extern void awg_clamp_mss(struct pbuf *q, uint16_t max_mss);
+          extern volatile uint32_t g_awg_tx_ok, g_awg_tx_fail, g_awg_rx_pkts;
           """
           wgif_c = '#include "wireguardif.h"\n' + wgif_extern + wgif_c.replace('#include "wireguardif.h"', '', 1)
 
@@ -127,10 +129,15 @@ jobs:
               flags=re.DOTALL
           )
 
+          # clamp TCP MSS of decrypted packets before they go up to lwIP (downlink)
+          old_in = "ip_input(pbuf, device->netif);"
+          assert wgif_c.count(old_in) == 1, "ip_input hook anchor not found"
+          wgif_c = wgif_c.replace(old_in, "awg_clamp_mss(pbuf, 1240);\n\t\t\t\t\t\t\t\t\t" + old_in, 1)
+
           # log the first packets the IP stack hands to the tunnel netif (is routing reaching it?)
           old_out = "\t// Send to peer that matches dest IP\n"
           assert wgif_c.count(old_out) == 1, "wireguardif_output hook anchor not found"
-          wgif_c = wgif_c.replace(old_out, old_out + "\t{ static int awg_dbg_out = 0; if (awg_dbg_out < 30) { awg_dbg_out++; ESP_LOGI(\"awg_out\", \"output %u bytes next_hop=%s\", (unsigned)q->tot_len, ip4addr_ntoa(ip4addr)); } }\n", 1)
+          wgif_c = wgif_c.replace(old_out, old_out + "\t{ static int awg_dbg_out = 0; if (awg_dbg_out < 30) { awg_dbg_out++; ESP_LOGI(\"awg_out\", \"output %u bytes next_hop=%s\", (unsigned)q->tot_len, ip4addr_ntoa(ip4addr)); } }\n\tawg_clamp_mss(q, 1240);\n", 1)
 
           new_peer_out = """static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct wireguard_peer *peer) {
               struct wireguard_device *device = (struct wireguard_device *)netif->state;
@@ -146,10 +153,13 @@ jobs:
                       awg_apply_tx_header_protection((uint8_t *)awg_pb->payload, s_len, q->tot_len);
                       err_t err = udp_sendto_if(device->udp_pcb, awg_pb, &peer->ip, peer->port, device->underlying_netif);
                       pbuf_free(awg_pb);
+                      if (err == ERR_OK) g_awg_tx_ok++; else g_awg_tx_fail++;
                       return err;
                   }
               }
-              return udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+              err_t err2 = udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+              if (err2 == ERR_OK) g_awg_tx_ok++; else g_awg_tx_fail++;
+              return err2;
           }"""
 
           wgif_c, n_peer = re.subn(
@@ -176,7 +186,7 @@ jobs:
 
           wgif_c = wgif_c.replace(
               "size_t len = p->len;",
-              "size_t len = p->len;\n\t\tstatic int awg_dbg_rx = 0;\n\t\tif (awg_dbg_rx < 40) { awg_dbg_rx++; ESP_LOGI(\"awg_rx\", \"rx %u bytes from port %u first4=%02x%02x%02x%02x\", (unsigned)len, (unsigned)port, (unsigned)((uint8_t *)p->payload)[0], (unsigned)(len > 1 ? ((uint8_t *)p->payload)[1] : 0), (unsigned)(len > 2 ? ((uint8_t *)p->payload)[2] : 0), (unsigned)(len > 3 ? ((uint8_t *)p->payload)[3] : 0)); }\n\t\tawg_strip_rx_prefix(&data, &len);\n\t\tif (awg_dbg_rx <= 40) { ESP_LOGI(\"awg_rx\", \"after strip: %u bytes\", (unsigned)len); }\n\t\tp->len = p->tot_len = len;"
+              "size_t len = p->len;\n\t\tg_awg_rx_pkts++;\n\t\tstatic int awg_dbg_rx = 0;\n\t\tif (awg_dbg_rx < 40) { awg_dbg_rx++; ESP_LOGI(\"awg_rx\", \"rx %u bytes from port %u first4=%02x%02x%02x%02x\", (unsigned)len, (unsigned)port, (unsigned)((uint8_t *)p->payload)[0], (unsigned)(len > 1 ? ((uint8_t *)p->payload)[1] : 0), (unsigned)(len > 2 ? ((uint8_t *)p->payload)[2] : 0), (unsigned)(len > 3 ? ((uint8_t *)p->payload)[3] : 0)); }\n\t\tawg_strip_rx_prefix(&data, &len);\n\t\tif (awg_dbg_rx <= 40) { ESP_LOGI(\"awg_rx\", \"after strip: %u bytes\", (unsigned)len); }\n\t\tp->len = p->tot_len = len;"
           )
 
           with open(wgif_c_path, "w") as f:

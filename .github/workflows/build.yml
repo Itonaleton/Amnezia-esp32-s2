@@ -127,6 +127,11 @@ jobs:
               flags=re.DOTALL
           )
 
+          # log the first packets the IP stack hands to the tunnel netif (is routing reaching it?)
+          old_out = "\t// Send to peer that matches dest IP\n"
+          assert wgif_c.count(old_out) == 1, "wireguardif_output hook anchor not found"
+          wgif_c = wgif_c.replace(old_out, old_out + "\t{ static int awg_dbg_out = 0; if (awg_dbg_out < 30) { awg_dbg_out++; ESP_LOGI(\"awg_out\", \"output %u bytes next_hop=%s\", (unsigned)q->tot_len, ip4addr_ntoa(ip4addr)); } }\n", 1)
+
           new_peer_out = """static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct wireguard_peer *peer) {
               struct wireguard_device *device = (struct wireguard_device *)netif->state;
               if (!device || !device->udp_pcb || !q || !q->payload) return ERR_ARG;

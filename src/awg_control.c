@@ -562,7 +562,12 @@ static int cmd_awg_up(int argc, char **argv) {
     if (wg_ctx.netif) {
         wg_ctx.netif->mtu = 1320;
         netif_set_default(wg_ctx.netif);
-        ip_napt_enable(wg_ctx.netif->ip_addr.u_addr.ip4.addr, 1);
+        /* NAPT stays enabled on the AP (inside) netif only (done in main). Enabling it on the
+           tunnel (outside) netif stops reverse translation of replies coming back from the server. */
+        printf("AWG_NET: default=%c%c%u mtu=%u\n",
+               wg_ctx.netif->name[0], wg_ctx.netif->name[1], (unsigned)wg_ctx.netif->num,
+               (unsigned)wg_ctx.netif->mtu);
+        fflush(stdout);
     }
 
     ip_addr_t dns_srv;

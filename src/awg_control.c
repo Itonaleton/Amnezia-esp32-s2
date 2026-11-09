@@ -713,20 +713,29 @@ static int cmd_awg_status(int argc, char **argv) {
 }
 
 /* ------------------------------------------------------------------------------------
- * LED indication
- *   everything fine : one short blink every 30 s ("heartbeat")
- *   something wrong : a group of quick blinks, repeated every 3 s while the problem lasts
+ * LED indication  (RGB LED of the official Flipper Zero Wi-Fi devboard)
+ *   everything fine : one short GREEN blink every 30 s ("heartbeat")
+ *   something wrong : a group of quick RED blinks, repeated every 3 s while the problem lasts
  *        2 blinks -> no connection to the upstream Wi-Fi (STA)
  *        3 blinks -> tunnel was requested (awg_up) but is not up / lost the server
  *        4 blinks -> low free memory
  * A problem must last 8 s before it is shown (avoids flicker during re-connects).
- * Change AWG_LED_GPIO (or define it in build flags) if your LED is on another pin.
+ *
+ * Pin defaults are for the Flipper Wi-Fi devboard: blue = GPIO4, green = GPIO5, red = GPIO6,
+ * active LOW (pin LOW = light on). For a board with a single LED set AWG_LED_PIN_OK and
+ * AWG_LED_PIN_BAD to the same pin; use -1 for a pin that does not exist.
  * ------------------------------------------------------------------------------------ */
-#ifndef AWG_LED_GPIO
-#define AWG_LED_GPIO 2            /* same pin as the stock firmware */
+#ifndef AWG_LED_PIN_OK
+#define AWG_LED_PIN_OK 5          /* green: heartbeat */
+#endif
+#ifndef AWG_LED_PIN_BAD
+#define AWG_LED_PIN_BAD 6         /* red: problem */
+#endif
+#ifndef AWG_LED_PIN_UNUSED
+#define AWG_LED_PIN_UNUSED 4      /* blue: kept off */
 #endif
 #ifndef AWG_LED_ACTIVE_LOW
-#define AWG_LED_ACTIVE_LOW 0      /* set to 1 if the LED lights when the pin is LOW */
+#define AWG_LED_ACTIVE_LOW 1      /* 1 = the LED lights when the pin is LOW */
 #endif
 #define AWG_LED_HEARTBEAT_MS        30000
 #define AWG_LED_PROBLEM_REPEAT_MS    3000
@@ -736,15 +745,23 @@ static int cmd_awg_status(int argc, char **argv) {
 extern bool ap_connect;           /* main: STA connected and has an IP */
 extern char *ssid;                /* main: configured upstream SSID ("" = AP-only mode) */
 
-static void awg_led_set(bool on) {
-    gpio_set_level(AWG_LED_GPIO, ((on ? 1 : 0) ^ AWG_LED_ACTIVE_LOW) ? 1 : 0);
+static void awg_led_pin_init(int pin) {
+    if (pin < 0) return;
+    gpio_reset_pin(pin);
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(pin, AWG_LED_ACTIVE_LOW ? 1 : 0);      /* off */
 }
 
-static void awg_led_blink(int times, int on_ms, int off_ms) {
+static void awg_led_set(int pin, bool on) {
+    if (pin < 0) return;
+    gpio_set_level(pin, ((on ? 1 : 0) ^ AWG_LED_ACTIVE_LOW) ? 1 : 0);
+}
+
+static void awg_led_blink(int pin, int times, int on_ms, int off_ms) {
     for (int i = 0; i < times; i++) {
-        awg_led_set(true);
+        awg_led_set(pin, true);
         vTaskDelay(pdMS_TO_TICKS(on_ms));
-        awg_led_set(false);
+        awg_led_set(pin, false);
         if (off_ms > 0) vTaskDelay(pdMS_TO_TICKS(off_ms));
     }
 }
@@ -762,9 +779,9 @@ static int awg_led_problem(void) {
 }
 
 void awg_led_task(void *arg) {
-    gpio_reset_pin(AWG_LED_GPIO);
-    gpio_set_direction(AWG_LED_GPIO, GPIO_MODE_OUTPUT);
-    awg_led_set(false);
+    awg_led_pin_init(AWG_LED_PIN_UNUSED);
+    awg_led_pin_init(AWG_LED_PIN_OK);
+    awg_led_pin_init(AWG_LED_PIN_BAD);
 
     int64_t now = esp_timer_get_time() / 1000;
     int64_t last_heartbeat = now - AWG_LED_HEARTBEAT_MS + 5000;   /* first heartbeat 5 s after start */
@@ -786,11 +803,11 @@ void awg_led_task(void *arg) {
         if (bad_kind != 0) {
             if (now - bad_since >= AWG_LED_PROBLEM_DEBOUNCE_MS &&
                 now - last_problem_show >= AWG_LED_PROBLEM_REPEAT_MS) {
-                awg_led_blink(bad_kind, 120, 180);
+                awg_led_blink(AWG_LED_PIN_BAD, bad_kind, 120, 180);
                 last_problem_show = now;
             }
         } else if (now - last_heartbeat >= AWG_LED_HEARTBEAT_MS) {
-            awg_led_blink(1, 150, 0);
+            awg_led_blink(AWG_LED_PIN_OK, 1, 200, 0);
             last_heartbeat = now;
         }
         vTaskDelay(pdMS_TO_TICKS(250));

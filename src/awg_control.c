@@ -7,6 +7,8 @@
 #include <sys/time.h>
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
 #include "esp_console.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -56,6 +58,7 @@ static wireguard_config_t wg_config = ESP_WIREGUARD_CONFIG_DEFAULT();
 static wireguard_ctx_t wg_ctx = {0};
 static bool wg_inited = false;
 static bool wg_active = false;
+static volatile bool awg_wanted = false;   /* user asked for the tunnel (awg_up called) */
 static struct netif *orig_default_netif = NULL;
 static uint32_t awg_pkt_counter = 0;
 
@@ -364,6 +367,8 @@ void awg_send_pre_handshake(struct udp_pcb *pcb, const ip_addr_t *ip, uint16_t p
 volatile uint32_t g_awg_tx_ok = 0;
 volatile uint32_t g_awg_tx_fail = 0;
 volatile uint32_t g_awg_rx_pkts = 0;
+volatile uint32_t g_awg_tx_bytes = 0;
+volatile uint32_t g_awg_rx_bytes = 0;
 
 /* TCP MSS clamping: rewrite the MSS option of IPv4 TCP SYN/SYN-ACK packets so that
  * segments fit into the tunnel MTU (prevents the classic "small pages load, big ones hang"
@@ -530,6 +535,7 @@ static int cmd_awg_i1(int argc, char **argv) {
 }
 
 static int cmd_awg_up(int argc, char **argv) {
+    awg_wanted = true;
     if (wg_active) {
         printf("AWG_STATUS: ALREADY_RUNNING\n");
         fflush(stdout);
@@ -628,6 +634,7 @@ static int cmd_awg_up(int argc, char **argv) {
 }
 
 static int cmd_awg_down(int argc, char **argv) {
+    awg_wanted = false;
     if (orig_default_netif != NULL) {
         netif_set_default(orig_default_netif);
     }
@@ -638,6 +645,7 @@ static int cmd_awg_down(int argc, char **argv) {
 }
 
 static int cmd_awg_wipe(int argc, char **argv) {
+    awg_wanted = false;
     if (orig_default_netif != NULL) {
         netif_set_default(orig_default_netif);
     }
@@ -650,6 +658,42 @@ static int cmd_awg_wipe(int argc, char **argv) {
     g_awg_cfg.h4_min = g_awg_cfg.h4_max = 4;
     printf("AWG_STATUS: RAM_WIPED\n");
     fflush(stdout);
+    return 0;
+}
+
+/* Live speed: call repeatedly; each call reports the rate since the previous call.
+ * Output uses '|' as a line separator so the Flipper app can show it on several lines. */
+static int cmd_awg_speed(int argc, char **argv) {
+    static int64_t last_us = 0;
+    static uint32_t last_txp = 0, last_txb = 0, last_rxp = 0, last_rxb = 0, last_fail = 0;
+
+    int64_t now = esp_timer_get_time();
+    uint32_t txp = g_awg_tx_ok, txb = g_awg_tx_bytes, rxp = g_awg_rx_pkts, rxb = g_awg_rx_bytes;
+    uint32_t fail = g_awg_tx_fail;
+
+    if (last_us == 0) {
+        last_us = now; last_txp = txp; last_txb = txb; last_rxp = rxp; last_rxb = rxb; last_fail = fail;
+        printf("AWG_SPEED: baseline set\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    uint32_t dt_ms = (uint32_t)((now - last_us) / 1000);
+    if (dt_ms == 0) dt_ms = 1;
+
+    uint32_t tx_pps = (uint32_t)(((uint64_t)(txp - last_txp) * 1000ULL) / dt_ms);
+    uint32_t rx_pps = (uint32_t)(((uint64_t)(rxp - last_rxp) * 1000ULL) / dt_ms);
+    /* KB/s * 10 (one decimal), KB = 1024 bytes */
+    uint32_t tx_k10 = (uint32_t)(((uint64_t)(txb - last_txb) * 10000ULL) / (1024ULL * dt_ms));
+    uint32_t rx_k10 = (uint32_t)(((uint64_t)(rxb - last_rxb) * 10000ULL) / (1024ULL * dt_ms));
+
+    printf("AWG_SPEED: TX %u pkt/s  %u.%u KB/s|RX %u pkt/s  %u.%u KB/s|tx_fail +%u  dt %u ms\n",
+           (unsigned)tx_pps, (unsigned)(tx_k10 / 10), (unsigned)(tx_k10 % 10),
+           (unsigned)rx_pps, (unsigned)(rx_k10 / 10), (unsigned)(rx_k10 % 10),
+           (unsigned)(fail - last_fail), (unsigned)dt_ms);
+    fflush(stdout);
+
+    last_us = now; last_txp = txp; last_txb = txb; last_rxp = rxp; last_rxb = rxb; last_fail = fail;
     return 0;
 }
 
@@ -668,6 +712,91 @@ static int cmd_awg_status(int argc, char **argv) {
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------
+ * LED indication
+ *   everything fine : one short blink every 30 s ("heartbeat")
+ *   something wrong : a group of quick blinks, repeated every 3 s while the problem lasts
+ *        2 blinks -> no connection to the upstream Wi-Fi (STA)
+ *        3 blinks -> tunnel was requested (awg_up) but is not up / lost the server
+ *        4 blinks -> low free memory
+ * A problem must last 8 s before it is shown (avoids flicker during re-connects).
+ * Change AWG_LED_GPIO (or define it in build flags) if your LED is on another pin.
+ * ------------------------------------------------------------------------------------ */
+#ifndef AWG_LED_GPIO
+#define AWG_LED_GPIO 2            /* same pin as the stock firmware */
+#endif
+#ifndef AWG_LED_ACTIVE_LOW
+#define AWG_LED_ACTIVE_LOW 0      /* set to 1 if the LED lights when the pin is LOW */
+#endif
+#define AWG_LED_HEARTBEAT_MS        30000
+#define AWG_LED_PROBLEM_REPEAT_MS    3000
+#define AWG_LED_PROBLEM_DEBOUNCE_MS  8000
+#define AWG_LED_LOW_HEAP_BYTES      16000
+
+extern bool ap_connect;           /* main: STA connected and has an IP */
+extern char *ssid;                /* main: configured upstream SSID ("" = AP-only mode) */
+
+static void awg_led_set(bool on) {
+    gpio_set_level(AWG_LED_GPIO, ((on ? 1 : 0) ^ AWG_LED_ACTIVE_LOW) ? 1 : 0);
+}
+
+static void awg_led_blink(int times, int on_ms, int off_ms) {
+    for (int i = 0; i < times; i++) {
+        awg_led_set(true);
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+        awg_led_set(false);
+        if (off_ms > 0) vTaskDelay(pdMS_TO_TICKS(off_ms));
+    }
+}
+
+/* 0 = fine, otherwise the number of blinks that signals the problem */
+static int awg_led_problem(void) {
+    bool sta_expected = (ssid != NULL && ssid[0] != '\0');
+    if (sta_expected && !ap_connect) return 2;
+    if (awg_wanted) {
+        bool up = wg_inited && wg_active && (esp_wireguardif_peer_is_up(&wg_ctx) == ESP_OK);
+        if (!up) return 3;
+    }
+    if (esp_get_free_heap_size() < AWG_LED_LOW_HEAP_BYTES) return 4;
+    return 0;
+}
+
+void awg_led_task(void *arg) {
+    gpio_reset_pin(AWG_LED_GPIO);
+    gpio_set_direction(AWG_LED_GPIO, GPIO_MODE_OUTPUT);
+    awg_led_set(false);
+
+    int64_t now = esp_timer_get_time() / 1000;
+    int64_t last_heartbeat = now - AWG_LED_HEARTBEAT_MS + 5000;   /* first heartbeat 5 s after start */
+    int64_t last_problem_show = 0;
+    int64_t bad_since = 0;
+    int bad_kind = 0;
+
+    for (;;) {
+        now = esp_timer_get_time() / 1000;
+        int p = awg_led_problem();
+        if (p == 0) {
+            bad_kind = 0;
+            bad_since = 0;
+        } else if (p != bad_kind) {
+            bad_kind = p;
+            bad_since = now;
+        }
+
+        if (bad_kind != 0) {
+            if (now - bad_since >= AWG_LED_PROBLEM_DEBOUNCE_MS &&
+                now - last_problem_show >= AWG_LED_PROBLEM_REPEAT_MS) {
+                awg_led_blink(bad_kind, 120, 180);
+                last_problem_show = now;
+            }
+        } else if (now - last_heartbeat >= AWG_LED_HEARTBEAT_MS) {
+            awg_led_blink(1, 150, 0);
+            last_heartbeat = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
 void register_awg_commands(void) {
     const esp_console_cmd_t cmds[] = {
         { .command = "awg_param",    .help = "Set AmneziaWG parameter (RAM only)", .func = &cmd_awg_param },
@@ -677,6 +806,7 @@ void register_awg_commands(void) {
         { .command = "awg_down",     .help = "Stop tunnel, restore direct route",  .func = &cmd_awg_down },
         { .command = "awg_wipe",     .help = "Stop tunnel and wipe RAM config",    .func = &cmd_awg_wipe },
         { .command = "awg_status",   .help = "Show tunnel status",                 .func = &cmd_awg_status },
+        { .command = "awg_speed",    .help = "Show tunnel speed since last call", .func = &cmd_awg_speed },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));

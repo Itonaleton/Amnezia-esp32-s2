@@ -101,6 +101,7 @@ jobs:
           extern void awg_send_pre_handshake(struct udp_pcb *pcb, const ip_addr_t *ip, uint16_t port);
           extern void awg_clamp_mss(struct pbuf *q, uint16_t max_mss);
           extern volatile uint32_t g_awg_tx_ok, g_awg_tx_fail, g_awg_rx_pkts;
+          extern volatile uint32_t g_awg_tx_bytes, g_awg_rx_bytes;
           """
           wgif_c = '#include "wireguardif.h"\n' + wgif_extern + wgif_c.replace('#include "wireguardif.h"', '', 1)
 
@@ -153,12 +154,12 @@ jobs:
                       awg_apply_tx_header_protection((uint8_t *)awg_pb->payload, s_len, q->tot_len);
                       err_t err = udp_sendto_if(device->udp_pcb, awg_pb, &peer->ip, peer->port, device->underlying_netif);
                       pbuf_free(awg_pb);
-                      if (err == ERR_OK) g_awg_tx_ok++; else g_awg_tx_fail++;
+                      if (err == ERR_OK) { g_awg_tx_ok++; g_awg_tx_bytes += (uint32_t)(s_len + q->tot_len); } else { g_awg_tx_fail++; }
                       return err;
                   }
               }
               err_t err2 = udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
-              if (err2 == ERR_OK) g_awg_tx_ok++; else g_awg_tx_fail++;
+              if (err2 == ERR_OK) { g_awg_tx_ok++; g_awg_tx_bytes += (uint32_t)q->tot_len; } else { g_awg_tx_fail++; }
               return err2;
           }"""
 
@@ -186,12 +187,25 @@ jobs:
 
           wgif_c = wgif_c.replace(
               "size_t len = p->len;",
-              "size_t len = p->len;\n\t\tg_awg_rx_pkts++;\n\t\tstatic int awg_dbg_rx = 0;\n\t\tif (awg_dbg_rx < 40) { awg_dbg_rx++; ESP_LOGI(\"awg_rx\", \"rx %u bytes from port %u first4=%02x%02x%02x%02x\", (unsigned)len, (unsigned)port, (unsigned)((uint8_t *)p->payload)[0], (unsigned)(len > 1 ? ((uint8_t *)p->payload)[1] : 0), (unsigned)(len > 2 ? ((uint8_t *)p->payload)[2] : 0), (unsigned)(len > 3 ? ((uint8_t *)p->payload)[3] : 0)); }\n\t\tawg_strip_rx_prefix(&data, &len);\n\t\tif (awg_dbg_rx <= 40) { ESP_LOGI(\"awg_rx\", \"after strip: %u bytes\", (unsigned)len); }\n\t\tp->len = p->tot_len = len;"
+              "size_t len = p->len;\n\t\tg_awg_rx_pkts++;\n\t\tg_awg_rx_bytes += (uint32_t)p->tot_len;\n\t\tstatic int awg_dbg_rx = 0;\n\t\tif (awg_dbg_rx < 40) { awg_dbg_rx++; ESP_LOGI(\"awg_rx\", \"rx %u bytes from port %u first4=%02x%02x%02x%02x\", (unsigned)len, (unsigned)port, (unsigned)((uint8_t *)p->payload)[0], (unsigned)(len > 1 ? ((uint8_t *)p->payload)[1] : 0), (unsigned)(len > 2 ? ((uint8_t *)p->payload)[2] : 0), (unsigned)(len > 3 ? ((uint8_t *)p->payload)[3] : 0)); }\n\t\tawg_strip_rx_prefix(&data, &len);\n\t\tif (awg_dbg_rx <= 40) { ESP_LOGI(\"awg_rx\", \"after strip: %u bytes\", (unsigned)len); }\n\t\tp->len = p->tot_len = len;"
           )
 
           with open(wgif_c_path, "w") as f:
               f.write(wgif_c)
           EOF
+
+          # LED: let awg_led_task (src/awg_control.c) drive the status LED instead of the stock thread
+          python3 - << 'EOF2'
+          import re
+          path = "src/esp32_nat_router.c"
+          src = open(path).read()
+          pat = r"void \*led_status_thread\(void \*p\)\s*\{.*?\n\}\n"
+          new = "extern void awg_led_task(void *arg);\n\nvoid *led_status_thread(void *p)\n{\n    awg_led_task(p);\n    return NULL;\n}\n"
+          src, n = re.subn(pat, lambda m: new, src, count=1, flags=re.DOTALL)
+          print("led thread patched:", n)
+          assert n == 1, "led_status_thread patch did NOT apply"
+          open(path, "w").write(src)
+          EOF2
 
       - name: Build
         run: pio run -e esp32-s2
